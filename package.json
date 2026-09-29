@@ -1,9 +1,9 @@
 {
-  "name": "@BeyondandSharp/dsh-plugin-notoken",
+  "name": "@beyondandsharp/dsh-plugin-notoken",
   "version": "1.0.0",
-  "private": true,
+  "description": "DSH host plugin: one stable login entry that exchanges the process launch token for the browser-session cookie, so a first visit needs no ?token=... in the URL. WARNING: this removes the authentication step.",
+  "license": "MIT",
   "type": "module",
-  "description": "DSH host plugin: one stable login entry that exchanges the process launch token for the browser-session cookie, so a first visit needs no ?token=... in the URL.",
   "main": "notoken.js",
   "exports": {
     ".": "./notoken.js",
@@ -12,10 +12,25 @@
   "files": [
     "notoken.js",
     "cordis.patch.yml",
-    "README.md"
+    "README.md",
+    "LICENSE",
+    "examples/"
   ],
   "scripts": {
-    "test": "node --test"
+    "test": "node --test",
+    "prepublishOnly": "node --test"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/BeyondandSharp/dsh-plugin-notoken.git"
+  },
+  "homepage": "https://github.com/BeyondandSharp/dsh-plugin-notoken#readme",
+  "bugs": {
+    "url": "https://github.com/BeyondandSharp/dsh-plugin-notoken/issues"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
   },
   "dsh": {
     "bundle": {

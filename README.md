@@ -28,8 +28,10 @@ GET /__dsh_login
 ## 安装
 
 ```sh
-$DSH plugin --profile web add /path/to/dsh-plugin-notoken    # DSH=/path/to/dsh
+$DSH plugin --profile web add @beyondandsharp/dsh-plugin-notoken         # 从 npm
+# 也可以直接装 GitHub 或本地目录：
 $DSH plugin --profile web add github:BeyondandSharp/dsh-plugin-notoken
+$DSH plugin --profile web add /path/to/dsh-plugin-notoken                # DSH=/path/to/dsh
 ```
 
 ## nginx
