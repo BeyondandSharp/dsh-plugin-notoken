@@ -1,0 +1,28 @@
+# Bundle layer for the local `notoken-login` plugin: one host row that
+# registers the login entry route (default GET /__dsh_login).
+#
+# The route exchanges the running process's launch token for the dsh-auth-*
+# browser cookie inside the Host process, so a first visit does not need
+# ?token=... in the URL. Read README.md before enabling this: the entry hands
+# a full operator browser session to anyone who can reach the port and pass
+# the connection trust fence.
+#
+# The row id intentionally avoids the `ui-skin-` prefix: the skin managers own
+# every `ui-skin-*` row and would rewrite or disable it.
+- insert:
+    - id: plugin-notoken
+      name: '@local/dsh-plugin-notoken'
+      config:
+        # Installed-application launches are what makes this necessary: an
+        # Android PWA/WebAPK (home-screen icon) or any external-app launch is
+        # labelled `Sec-Fetch-Site: cross-site` by Chrome, so the strict fence
+        # answers 403 to the icon while the same URL in a tab works. With this
+        # on, the entry allows a browser-labelled cross-site request only after
+        # re-asking the same fence without those labels (the authority must
+        # still be loopback/trustedHosts), and the session cookie is
+        # SameSite=Strict, so no cross-site page can ever use it. Set it to
+        # `false` for the strict behaviour (bookmarks and typed URLs only).
+        allowCrossSiteNavigation: true
+        # Remaining options are optional; unknown keys fail the plugin load.
+        #   path: /__dsh_login   # one path segment, no trailing slash
+        #   mode: exchange       # exchange (default) | redirect

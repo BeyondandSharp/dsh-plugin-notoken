@@ -1,0 +1,25 @@
+{
+  "name": "@local/dsh-plugin-notoken",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "DSH host plugin: one stable login entry that exchanges the process launch token for the browser-session cookie, so a first visit needs no ?token=... in the URL.",
+  "main": "notoken.js",
+  "exports": {
+    ".": "./notoken.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "notoken.js",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

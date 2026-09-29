@@ -1,0 +1,10 @@
+# Variant overlay: same plugin row with `allowCrossSiteNavigation` on. Used by
+# verify/e2e.sh to prove that a browser-labelled cross-site request (a link
+# clicked on another site, or an installed application launch) whose authority
+# still passes the connection fence is allowed, while an untrusted authority
+# stays refused.
+- insert:
+    - id: plugin-notoken
+      name: '../notoken.js'
+      config:
+        allowCrossSiteNavigation: true

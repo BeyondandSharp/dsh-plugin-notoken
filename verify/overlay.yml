@@ -1,0 +1,12 @@
+# Zero-install overlay: boot any profile with this plugin for one run, without
+# touching the profile's package.json or bundles list.
+#
+#   dsh web --patch <plugin-dir>/verify/overlay.yml --port 3199 --no-open
+#
+# A relative `name` is anchored to this file's directory by the launcher and
+# converted to a file URL, so the plugin loads straight from source. Do not
+# combine this overlay with an installed copy of the same row: the webserver
+# rejects a duplicate route path and the boot fails.
+- insert:
+    - id: plugin-notoken
+      name: '../notoken.js'
