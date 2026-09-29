@@ -11,7 +11,7 @@
 # every `ui-skin-*` row and would rewrite or disable it.
 - insert:
     - id: plugin-notoken
-      name: '@local/dsh-plugin-notoken'
+      name: '@BeyondandSharp/dsh-plugin-notoken'
       config:
         # Installed-application launches are what makes this necessary: an
         # Android PWA/WebAPK (home-screen icon) or any external-app launch is
