@@ -1,5 +1,5 @@
 {
-  "name": "@local/dsh-plugin-notoken",
+  "name": "@BeyondandSharp/dsh-plugin-notoken",
   "version": "1.0.0",
   "private": true,
   "type": "module",
