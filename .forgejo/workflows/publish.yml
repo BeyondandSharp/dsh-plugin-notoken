@@ -1,0 +1,63 @@
+# 打 tag（v*）→ 由你自己的 Forgejo Actions 自动发布到 npm。
+#
+# ── 认证：为什么是 secret 而不是 OIDC ──────────────────────────────────────
+# npm 的 Trusted Publishing 只信任 GitHub Actions 的 OIDC 身份，Forgejo 没有这条通道，
+# 所以用仓库 secret。一次性配置：
+#   Forgejo 仓库 → Settings → Actions → Secrets → 新增 NPM_TOKEN
+#   token 来源：npmjs.com → Access Tokens → Generate New Token → Granular Access Token
+#              Packages: Read and write（All packages 或选中该包）+ 勾选 Bypass 2FA
+#
+# ── 运行环境 ──────────────────────────────────────────────────────────────
+# 需要一台注册到本实例的 act_runner，标签包含 ubuntu-latest，且运行镜像自带 Node ≥ 22
+# 与 npm（例如把标签映射成 docker://node:24-bookworm）。因此这里刻意不用 setup-node，
+# 少一个外部依赖。
+#
+# ── 发布流程 ──────────────────────────────────────────────────────────────
+#   git add -A && git commit -m "..."
+#   pnpm version patch          # 改 version、提交、打 tag vX.Y.Z
+#   git push --follow-tags      # 触发本 workflow
+name: publish
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch: # 也可以在 Actions 页面手动补发
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: https://code.forgejo.org/actions/checkout@v4
+
+      # tag 必须与 package.json 的 version 一致，避免 v1.2.3 发出一个 1.0.0
+      - name: Check tag matches package.json
+        run: |
+          ref="${GITHUB_REF_NAME:-${GITHUB_REF##*/}}"
+          case "$ref" in
+            v*) ;;
+            *) echo "not a tag run ($ref); skipping the version check"; exit 0 ;;
+          esac
+          version="$(sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' package.json | head -n1)"
+          echo "package.json=$version  tag=$ref"
+          if [ "$version" != "${ref#v}" ]; then
+            echo "::error::tag $ref does not match package.json version $version"
+            exit 1
+          fi
+
+      - name: Test
+        run: |
+          node --version
+          node --test
+
+      - name: Publish to npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -z "$NODE_AUTH_TOKEN" ]; then
+            echo "::error::NPM_TOKEN secret is not set on this repository"
+            exit 1
+          fi
+          printf '//registry.npmjs.org/:_authToken=%s\n' "$NODE_AUTH_TOKEN" > "$HOME/.npmrc"
+          chmod 600 "$HOME/.npmrc"
+          npm publish --access public
