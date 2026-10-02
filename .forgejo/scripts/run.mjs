@@ -133,6 +133,24 @@ async function runSubprocessProgram(name, env) {
   return runCommand(process.execPath, [path], { cwd: packageDir(env), env });
 }
 
+/**
+ * Container capabilities. The programs need Node (a given) and, for npm's web
+ * authorisation, `script(1)` from util-linux: Debian/Ubuntu images ship it,
+ * Alpine's BusyBox does not (there it needs `apk add util-linux`). Reporting the
+ * gap here turns a confusing failure at publish time into an early, actionable
+ * one. Alpine is otherwise fine: the workflow runs `sh`, not `bash`.
+ */
+export function probeEnvironment(run) {
+  const has = (binary) =>
+    run('sh', ['-c', `command -v ${binary}`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).status === 0;
+  const shell = has('sh');
+  return {
+    shell,
+    pty: has('script'),
+    timeout: has('timeout'),
+  };
+}
+
 async function verifyAction(env) {
   const dir = (env.GITHUB_ACTION_PATH || HERE.replace(/\/scripts$/, '')).replace(/\/+$/, '');
   const missing = REQUIRED_SCRIPTS.filter((name) => !existsSync(join(dir, 'scripts', name)));
@@ -144,6 +162,19 @@ async function verifyAction(env) {
     return 1;
   }
   process.stdout.write(`Action 脚本齐全：${dir}/scripts（${REQUIRED_SCRIPTS.length} 个文件）\n`);
+
+  const { spawnSync } = await import('node:child_process');
+  const capabilities = probeEnvironment(spawnSync);
+  process.stdout.write(
+    `运行环境：sh=${capabilities.shell ? 'ok' : '缺失'} script(PTY)=${capabilities.pty ? 'ok' : '缺失'} timeout=${capabilities.timeout ? 'ok' : '缺失'}\n`,
+  );
+  if (!capabilities.pty) {
+    process.stdout.write(
+      '提示：没有 script(1) 时 npm 无法进入网页登录/二次验证流程（不会得到 auth/cli 链接）。\n' +
+        '  Alpine: apk add --no-cache util-linux\n' +
+        '  Debian 系镜像自带；也可用 container.image: node:22-bookworm。\n',
+    );
+  }
   return 0;
 }
 

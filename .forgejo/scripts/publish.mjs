@@ -26,6 +26,22 @@ export const IS_DIRECT = (() => {
 * reached the user.
 */
 
+/**
+ * npm only starts its web authorisation (the `auth/cli/<uuid>` link) when it has
+ * a terminal; with piped stdin it just fails with E401. `script(1)` provides
+ * that terminal. It ships with util-linux, which Debian/Ubuntu images have but
+ * Alpine's BusyBox does not — so when it is missing the run must fail loudly
+ * instead of silently publishing nothing.
+ */
+export function ptyAvailability(run, env = process.env) {
+  const probe = run('sh', ['-c', 'command -v script && command -v timeout'], {
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env,
+  });
+  return probe.status === 0;
+}
+
 /** One npm invocation. `usePty` runs it under script(1) so npm sees a terminal. */
 export function npmCommand(args, { usePty, timeoutSeconds } = {}) {
   const command = `npm ${args.join(' ')}`;
@@ -36,8 +52,9 @@ export function npmCommand(args, { usePty, timeoutSeconds } = {}) {
   return wrapped;
 }
 
-export function hasPty(run) {
-  return run('sh', ['-c', 'command -v script && command -v timeout'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).status === 0;
+/** Backwards-compatible alias. */
+export function hasPty(run, env) {
+  return ptyAvailability(run, env);
 }
 
 /** Strip the \r doubling and ANSI sequences a PTY introduces. */
@@ -56,7 +73,7 @@ export function cleanOutput(text) {
     const waitSeconds = Math.max(30, Math.round(waitMinutes * 60));
     const spawnSync = (await import('node:child_process')).spawnSync;
     const sleep = (ms) => new Promise((done) => setTimeout(done, ms));
-    const usePty = hasPty(spawnSync);
+    const usePty = ptyAvailability(spawnSync);
 
     // Every URL already forwarded in this run, so the same link is never sent twice.
     const announced = new Set();
@@ -127,6 +144,18 @@ export function cleanOutput(text) {
 
     // --- 1. login, if needed: relay npm's own auth/cli URL and wait for the human.
     if (!state.dryRun && !isAuthenticated()) {
+      if (!usePty) {
+        // Without a terminal npm cannot open its web flow, so no auth link can
+        // ever be produced — say exactly what to change instead of hanging.
+        process.stderr.write(
+          '需要交互式认证，但当前镜像里没有 script(1)，npm 无法进入网页登录/二次验证流程。\n' +
+            '请任选其一：\n' +
+            '  1) 用带 util-linux 的镜像（Debian 系自带），例如 container.image: node:22-bookworm；\n' +
+            '  2) 在 Alpine 里安装：apk add --no-cache util-linux（提供 script）+ coreutils/binutils（可选 timeout）；\n' +
+            '  3) 通过 NPM_SCRIPT_BINARY 指向等效的 PTY 工具。\n',
+        );
+        process.exit(1);
+      }
       process.stdout.write('npm 未登录：发起 npm 网页登录（npm 会给出一次性登录链接）\n');
       const login = await runNpm(['login', '--auth-type=web'], {
           phase: 'npm-login-required',

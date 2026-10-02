@@ -62,9 +62,11 @@ concurrency:
   group: release-${{ github.ref_name }}
   cancel-in-progress: false
 
+# `sh`, not `bash`: Alpine and other minimal images ship BusyBox sh but no bash
+# (`/bin/sh` exists everywhere). The few remaining shell lines are POSIX.
 defaults:
   run:
-    shell: bash
+    shell: sh
 
 jobs:
   release:

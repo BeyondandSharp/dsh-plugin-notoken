@@ -72,6 +72,41 @@ workflow 里每一步都长这样（`配置里没有内嵌脚本`）：
 3. `设置 → Actions → Variables`：**`MESSAGE_PUSHER_URL`（必填）** —— 推送到哪个地址由仓库配置决定，Action 里不内置任何地址，因此换仓库不会被带到别处。
 4. 该仓库有可用的 runner，且 runner 能出网访问 registry 与你的推送地址。
 
+### 容器镜像要求（Alpine / 精简镜像）
+
+| 需要 | 说明 |
+| --- | --- |
+| `sh` | 工作流用 `shell: sh` 运行，**不依赖 bash**（Alpine、distroless 等都能跑） |
+| `node` | 镜像里要有 Node ≥ 18；`container.image` 默认 `node:22-bookworm` |
+| `script`（util-linux） | **只有走网页登录/二次验证时才需要**：npm 必须看到终端才会给出 `auth/cli/<uuid>` 链接 |
+| `timeout` | 用于给登录/验证设定等待上限（busybox 自带） |
+
+**Alpine 用户**：
+
+```yaml
+    container:
+      image: node:22-alpine
+```
+
+```dockerfile
+# 若该镜像里没有 script(1)：
+apk add --no-cache util-linux
+```
+
+跑到 `Verify action scripts` 步骤时日志会打印能力探测结果：
+
+```
+运行环境：sh=ok script(PTY)=ok timeout=ok
+```
+
+如果显示 `script(PTY)=缺失`，`publish` 阶段需要交互式认证时会**立即失败并给出修复指引**（不会静默发不出去）。想先确认，可以在仓库里跑一次：
+
+```bash
+docker run --rm node:22-alpine sh -c 'command -v script || echo "缺 script：需要 apk add util-linux"'
+```
+
+> 如果发布**不需要**交互式认证（例如账号配了 npm trusted publishing / OIDC），即使没有 `script` 也能正常发布。
+
 ### runner 标签与镜像（重要）
 
 workflow 里的两者都是变量，带默认值，**不配置也能跑**：
