@@ -83,28 +83,67 @@ jobs:
         with:
           fetch-depth: 0
 
-      # The Action is used as a copy of npm-publish/ renamed to .forgejo, so
-      # github.action_path points there. Fall back to the parent of the
-      # workspace, which is where a checked-out .forgejo directory lives.
+      # This repository is NOT used as an `action`, it only carries a workflow, so
+      # Forgejo leaves github.action_path empty (that variable is set only when a
+      # `uses: ./path` local action runs). The copied, renamed directory is a
+      # checkout of the target repository, i.e. $GITHUB_WORKSPACE/.forgejo.
+      # Fall back to a marker-driven search in case checkout used a `path:`.
       - name: Locate action directory
         id: locate
         run: |
           set -euo pipefail
           # Create the staging directory first: the failure-notification step
           # reuses it even when an earlier step is what failed.
-          mkdir -p "$RUNNER_TEMP/npm-publish"
-          dir="${{ github.action_path }}"
-          if [ -z "$dir" ]; then dir="$(dirname "$GITHUB_WORKSPACE")"; fi
-          if [ ! -d "$dir/workflows" ]; then
-            echo "找不到 Action 目录（其中应有 workflows/ 子目录）" >&2
+          stage="$RUNNER_TEMP/npm-publish"
+          mkdir -p "$stage"
+          workspace="${GITHUB_WORKSPACE:-$PWD}"
+
+          is_action_dir() {
+            [ -d "$1/workflows" ] && [ -f "$1/scripts/notify-lib.mjs" ]
+          }
+
+          candidates=()
+          if [ -n "${{ github.action_path }}" ]; then
+            candidates+=("${{ github.action_path }}")
+          fi
+          # 1. The documented layout: .forgejo copied to the repository root.
+          candidates+=("$workspace/.forgejo")
+          # 2. Nested or renamed directories: any path that carries both markers.
+          #    A read loop over a process substitution is whitespace-proof without
+          #    a heredoc terminator that could be re-indented when the script is
+          #    extracted from this YAML file.
+          while IFS= read -r found; do
+            if [ -n "$found" ]; then candidates+=("$found"); fi
+          done < <(find "$workspace" -maxdepth 6 -type d -name '.forgejo' -print 2>/dev/null || true)
+          # 3. Last resort: walk up from the workspace (older runners mounted the
+          #    repository next to the workspace rather than inside it). Guard the
+          #    loop so it never scans from the filesystem root.
+          walk="$(dirname "$workspace")"
+          for _ in 1 2 3; do
+            if [ "$walk" = '/' ]; then break; fi
+            if [ -d "$walk" ]; then candidates+=("$walk/.forgejo"); fi
+            walk="$(dirname "$walk")"
+          done
+
+          dir=''
+          for candidate in "${candidates[@]}"; do
+            if is_action_dir "$candidate"; then dir="$candidate"; break; fi
+          done
+
+          if [ -z "$dir" ]; then
+            echo "找不到 Action 目录（需要同时存在 workflows/ 与 scripts/notify-lib.mjs）" >&2
             echo "github.action_path='${{ github.action_path }}'" >&2
-            echo "GITHUB_WORKSPACE=$GITHUB_WORKSPACE" >&2
-            echo "candidate=$dir" >&2
-            ls -la "$(dirname "$GITHUB_WORKSPACE")" >&2 || true
+            echo "GITHUB_WORKSPACE=$workspace" >&2
+            echo "--- 工作区内与 action 目录相关的路径 ---" >&2
+            find "$workspace" -maxdepth 5 \( -name '.forgejo*' -o -name 'notify-lib.mjs' \) -print 2>/dev/null | head -50 >&2 || true
+            ls -la "$workspace" >&2 || true
+            echo "--- 工作区上级目录 ---" >&2
+            ls -la "$(dirname "$workspace")" >&2 || true
             exit 1
           fi
+
           echo "forgejo_dir=$dir" >> "$GITHUB_OUTPUT"
-          echo "Stage 目录：$RUNNER_TEMP/npm-publish"
+          echo "Stage 目录：$stage"
           echo "Action 目录：$dir"
 
       # The helper module is a real file (unit-tested directly), staged next to

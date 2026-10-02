@@ -182,17 +182,22 @@ node -e "import('/absolute/path/to/.forgejo/scripts/notify-lib.mjs').then((lib) 
 - 依赖 runner 提供 `docker` label 的容器任务；容器镜像固定为 `node:22-bookworm`，使用 `corepack` 驱动 pnpm/yarn。
 - 依赖 `actions/checkout@v4`（Forgejo 默认 actions registry）。若实例无法访问，请改成全限定 URL `https://code.forgejo.org/actions/checkout@v4`。
 - npm 二次验证的输出格式由 npm 决定；若 npm 改了文案，转发可能只能回退到「推送原始输出」。
+- **`github.action_path` 在这里是空的**：该变量只在 runner 执行「本地 action」（`uses: ./…`）时才有值，而本目录是**工作流**，不是 action。因此 `Locate action directory` 步骤不依赖它，按以下顺序定位：
+  1. `$GITHUB_WORKSPACE/.forgejo`（`.forgejo` 复制到仓库根目录的标准布局）；
+  2. `$GITHUB_WORKSPACE` 下任意含 `workflows/` + `scripts/notify-lib.mjs` 的 `.forgejo` 目录（应对 `checkout` 指定了 `path:` 或目录被重命名）；
+  3. 从 `$GITHUB_WORKSPACE` 向上最多 3 层的 `.forgejo`（应对旧版 runner 把仓库挂在工作区旁边）。
+
+  三者都失败时会打印 `github.action_path`、`GITHUB_WORKSPACE`、工作区内候选路径、以及工作区上/下级目录，便于直接定位布局问题。
 
 ## 常见问题
 
 | 现象 | 处理 |
 | --- | --- |
 | `未配置通知地址` | 在 `设置 → Actions → Variables` 里加 `MESSAGE_PUSHER_URL`（本 Action 不内置地址） |
-| `MESSAGE_PUSHER_URL 必须是 http(s) 地址` | 变量值写错了，补上 `https://` |
+| `找不到 Action 目录` | 确认 `.forgejo/` 整目录在仓库里（含 `workflows/` 与 `scripts/notify-lib.mjs`）；报错里会列出实际找到的路径 |
 | `缺少 NPM_TOKEN secret` | 在仓库 secrets 里配置 `NPM_TOKEN`（Automation / Granular token 均可） |
 | `版本必须严格大于 registry 上最新版` | tag 版本比 npm 上的旧；删掉 tag 换新版本，或确认是否想重发 |
 | `构建产物缺失` | 检查 `REQUIRED_ARTIFACTS`，或该项目的产物路径 |
-| `找不到 Action 目录` | `.forgejo` 目录不完整，确认 `workflows/` 与 `scripts/notify-lib.mjs` 都在 |
 | 收不到推送 | 检查 `MESSAGE_PUSHER_URL` 与（如需要）`MESSAGE_PUSHER_TOKEN`；把 `NOTIFY_REQUIRED` 设 `false` 可先不让它阻塞发布 |
 | 想知道投递内容 | 见上方「校验投递」；日志里也会打印「已把验证网址转发到 webhook（title=…）」 |
 
@@ -200,7 +205,7 @@ node -e "import('/absolute/path/to/.forgejo/scripts/notify-lib.mjs').then((lib) 
 
 本目录的代码在源仓库经过了单元测试与端到端冒烟（用假 npm 驱动真实的分段程序），但以下几项只有真实 Forgejo + runner 才能确认，建议第一次先推一个 `-rc` 预发布 tag 或先用 `dry_run` 演练：
 
-1. `github.action_path` 是否指向 `.forgejo`（否则 `Locate action directory` 步骤会打印诊断并回退到 `dirname "$GITHUB_WORKSPACE"`；若都不对，把该步骤里的 `dir=` 改成实际路径）。
+1. `Locate action directory` 能否找到 `.forgejo`（它先试 `$GITHUB_WORKSPACE/.forgejo`，再做标记搜索；失败时会打印候选路径与目录树，照着报错调整即可）。
 2. runner 是否提供 `docker` label，以及 `container: node:22-bookworm` 能否拉取、`corepack` 是否可用。
 3. `actions/checkout@v4` 在该实例的 actions registry 是否可达（否则改用全限定 URL）。
 4. npm 需要二次验证时的实际输出格式是否被成功提取并转发（日志会打印是否命中）。
