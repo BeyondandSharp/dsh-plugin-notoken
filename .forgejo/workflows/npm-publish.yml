@@ -538,7 +538,7 @@ jobs:
                   import { readFileSync, writeFileSync } from 'node:fs';
                   import { join } from 'node:path';
                   import { spawnSync } from 'node:child_process';
-                  import { buildPayload, deliver, errorSummary } from './notify-lib.mjs';
+                  import { buildPayload, deliver, errorSummary, isAuthUrl } from './notify-lib.mjs';
 
                   export const IS_DIRECT = String(process.argv[1] || '').endsWith('prepare.mjs');
 
@@ -619,7 +619,7 @@ jobs:
           import { appendFileSync, readFileSync } from 'node:fs';
           import { join } from 'node:path';
           import { spawn } from 'node:child_process';
-          import { buildPayload, deliver, errorSummary } from './notify-lib.mjs';
+          import { buildPayload, deliver, errorSummary, isAuthUrl } from './notify-lib.mjs';
           import { parseNpmAuthOutput } from './verification-parse.mjs';
 
           export const IS_DIRECT = String(process.argv[1] || '').endsWith('publish.mjs');
@@ -669,7 +669,9 @@ jobs:
             const announced = new Set();
             const relay = async (text, phase) => {
               const parsed = parseNpmAuthOutput(text);
-              if (!parsed.url || announced.has(parsed.url)) return parsed;
+              // Only npm's own authentication link is worth sending: a registry origin or a
+              // repository page would send the reader nowhere useful.
+              if (!parsed.url || !isAuthUrl(parsed.url) || announced.has(parsed.url)) return parsed;
               announced.add(parsed.url);
               if (state.dryRun) {
                 process.stdout.write(`dry-run：检测到 ${phase}，未投递（${parsed.url}）\n`);
@@ -811,7 +813,7 @@ jobs:
                   import { readFileSync } from 'node:fs';
                   import { join } from 'node:path';
                   import { spawnSync } from 'node:child_process';
-                  import { buildPayload, deliver, errorSummary } from './notify-lib.mjs';
+                  import { buildPayload, deliver, errorSummary, isAuthUrl } from './notify-lib.mjs';
 
                   export const IS_DIRECT = String(process.argv[1] || '').endsWith('release.mjs');
 
@@ -902,7 +904,7 @@ jobs:
           cat > "$stage/notify-failure.mjs" <<'NOTIFY_FAILURE_JS'
           import { existsSync, readFileSync } from 'node:fs';
           import { join } from 'node:path';
-          import { buildPayload, deliver, errorSummary } from './notify-lib.mjs';
+          import { buildPayload, deliver, errorSummary, isAuthUrl } from './notify-lib.mjs';
 
           const temp = process.env.RUNNER_TEMP || '/tmp';
           const corePath = join(temp, 'release.json');

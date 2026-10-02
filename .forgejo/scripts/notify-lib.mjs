@@ -136,17 +136,40 @@ function phaseMessage(phase, core = {}) {
   }
 }
 
-export function resolvePayloadUrl({ auth, core = {} } = {}) {
+/**
+ * The payload's `url` is the authentication link and nothing else. Falling back to
+ * the run page (or a registry origin) would send the reader somewhere useless, so
+ * an empty string is returned instead and `deliver` stays silent.
+ */
+export function resolvePayloadUrl({ auth } = {}) {
   const candidate = typeof auth === 'string' ? auth : auth?.url;
   if (isHttpUrl(candidate)) return candidate;
   if (typeof auth === 'string' && auth.trim()) {
     throw new Error(`auth url must be an http(s) URL: ${auth.trim()}`);
   }
-  const fallback = core.runUrl;
-  if (!isHttpUrl(fallback)) {
-    throw new Error('no http(s) URL available for the payload (auth.url and core.runUrl are both unusable)');
-  }
-  return fallback;
+  return '';
+}
+
+/** Notifications that only make sense with a real authentication link. */
+export const AUTH_PHASES = new Set(['npm-login-required', 'npm-2fa', 'npm-login']);
+
+/**
+ * Is this a URL a human can authenticate with? Requires an authentication path,
+ * so a bare registry origin (https://registry.npmjs.org) and a repository page
+ * (https://git.example.com/owner/repo/actions/runs/11) do not qualify.
+ */
+export function isAuthUrl(value) {
+  if (!isHttpUrl(value)) return false;
+  return /\/(?:auth|login|signin|sign-in|weblogin|web-login|oauth)\b/i.test(value);
+}
+
+/**
+ * Every notice is only worth sending with a real authentication link. A missing
+ * link is a reason to stay silent rather than to substitute the run page, the
+ * registry origin or a package page — those send the reader nowhere useful.
+ */
+export function shouldSend(payload) {
+  return isAuthUrl(payload.url);
 }
 
 export function buildPayload({
@@ -167,7 +190,7 @@ export function buildPayload({
   const repo = core.repo || env.GITHUB_REPOSITORY || '';
   const resolvedTitle = title || repoTitle(repo, repoOnly);
   const normalizedAuth = auth && typeof auth === 'object' ? auth : auth ? { url: auth } : undefined;
-  const url = resolvePayloadUrl({ auth: normalizedAuth, core });
+  const url = resolvePayloadUrl({ auth: normalizedAuth });
   const version = core.version || '';
   const packageValue = packageName || core.name || core.package || '';
   const summaryText =
@@ -196,7 +219,8 @@ export function buildPayload({
       expires_at: normalizedAuth?.expiresAt || '',
     },
     release: {
-      run_url: core.runUrl || '',
+      // No run_url here: it used to be forwarded as the payload url and is not
+      // something the reader should receive.
       npm_url: packageValue && version ? `https://www.npmjs.com/package/${packageValue}/v/${version}` : '',
       tarball: core.tarball || '',
     },
@@ -329,6 +353,13 @@ export async function deliver(payload, options = {}) {
   // Fail with an actionable message rather than a cryptic fetch error.
   if (!config.url) {
     throw new Error('未配置 MESSAGE_PUSHER_URL，无法投递通知');
+  }
+  if (!shouldSend(payload)) {
+    return {
+      skipped: true,
+      reason: `no authentication URL to send (url=${payload.url || '<empty>'})`,
+      previous: '',
+    };
   }
   const idempotent = options.idempotent !== false;
   const marker = idempotencyPath(config, payload.request_id, payload.url);

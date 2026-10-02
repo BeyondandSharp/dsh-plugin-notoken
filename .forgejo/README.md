@@ -117,6 +117,8 @@ dist-tag 默认：正式版 `latest`，含 `-` 的预发布版 `next`；可用�
 
 `phase` 取值：`publishing`、`npm-2fa`、`npm-login-required`、`published`、`failed`。（版本已存在时按幂等成功静默退出，不推送，避免重复推 tag 刷屏。）
 
+**只会发送认证链接，其它一律不发**：载荷的 `url` 必须是 npm 打印的授权链接（路径含 `auth`/`login`/`signin`/`web-login`/`oauth`）。run 页面（`https://git.…/actions/runs/11`）、registry 首页（`https://registry.npmjs.org`）这类地址**永远不会被发送**；没有可用认证链接时宁可不发，也不会拿别的地址替代。因此收到 webhook 就等于"有一条需要你点的链接"。
+
 `url` **永远是 npm 进程自己打印的那一条**，不做任何拼接或兜底：
 
 | 阶段 | `phase` | 来源 |
@@ -218,7 +220,7 @@ node -e "import('/absolute/path/to/.forgejo/scripts/notify-lib.mjs').then((lib) 
 | `npm 认证状态：未登录` | 正常现象：把推送里的登录网址在浏览器打开完成登录；工作流会在等待窗口内自动重试 |
 | `版本必须严格大于 registry 上最新版` | tag 版本比 npm 上的旧；删掉 tag 换新版本，或确认是否想重发 |
 | `构建产物缺失` | 检查 `REQUIRED_ARTIFACTS`，或该项目的产物路径 |
-| 收不到推送 | 检查 `MESSAGE_PUSHER_URL` 与（如需要）`MESSAGE_PUSHER_TOKEN`；把 `NOTIFY_REQUIRED` 设 `false` 可先不让它阻塞发布 |
+| 收不到推送 | 正常情况之一：本 Action **只在有认证链接时才推送**，普通进度/失败/成功不会打扰你。确认 `MESSAGE_PUSHER_URL`（如需 `MESSAGE_PUSHER_TOKEN`）配置正确即可 |
 | 想知道投递内容 | 见上方「校验投递」；日志里也会打印「已把验证网址转发到 webhook（title=…）」 |
 
 ## 首次使用需要在真实实例上确认的点
