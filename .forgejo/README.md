@@ -8,7 +8,8 @@ push tag v1.4.0
       ├─ 解析版本（tag 即版本）             resolve
       ├─ 预检：private/产物/tag 未移动/registry 版本比对   preflight
       ├─ 测试、构建、npm pack + sha256      Test / Build / prepare
-      ├─ npm whoami → 未登录就把登录网址推给用户
+      ├─ npm whoami → 未登录则发起 npm login --auth-type=web
+      │     └─ npm 打印 https://www.npmjs.com/auth/cli/<uuid> → 原样推给你
       ├─ npm publish（--access public --tag <dist-tag>）        publish
       │     ├─ 需要登录/二次验证 → 把 npm 打印的网址 POST 到 webhook
       │     ├─ 等待用户在浏览器完成（默认 15 分钟窗口）
@@ -74,6 +75,10 @@ dist-tag 默认：正式版 `latest`，含 `-` 的预发布版 `next`；可用�
 | `SKIP_TEST` | 空 | `true` 跳过 `npm test` |
 | `SKIP_BUILD` | 空 | `true` 跳过 `npm run build`（无 build 脚本时自动跳过） |
 | `RELEASE_DIST_TAG` | 空 | 固定 dist-tag |
+| `NPM_REGISTRY` | 空 | 指定认证用的 registry。默认取 `npm config get registry`；内网镜像请用这个或 `.npmrc` |
+| `NPM_LOGIN_URL` | 空 | 覆盖"先导登录提示"的网址；最终仍以 npm 自己打印的地址为准 |
+| `NPM_LOGIN_POLL_MINUTES` | `5` | 发起网页登录后，轮询 `npm whoami` 等待你完成的天花板 |
+| `NPM_MAX_ATTEMPTS` | `6` | `npm publish` 的最大尝试次数（供测试压缩） |
 | `NPM_AUTH_WAIT_MINUTES` | `15` | 等待人工完成登录/二次验证的总时长；超时后发布失败并推送 `failed` |
 | `NPM_AUTH_RETRY_DELAY_SECONDS` | 空 | 每次重试之间的等待秒数（默认 30s；从网址拿到验证码时 5s）。主要给测试用 |
 
@@ -115,7 +120,13 @@ dist-tag 默认：正式版 `latest`，含 `-` 的预发布版 `next`；可用�
 
 `phase` 取值：`publishing`、`npm-2fa`、`npm-login-required`、`published`、`failed`。（版本已存在时按幂等成功静默退出，不推送，避免重复推 tag 刷屏。）
 
-`npm-login-required` 出现两次是正常的但**只会推送一次**：开始时 `npm whoami` 失败会先推登录页；随后 `npm publish` 返回的 401 挑战网址通常就是同一个登录页，重复网址会被去重。
+`url` **就是 npm 自己给出的地址**，优先级为：
+
+1. `npm login --auth-type=web` 打印的 `https://www.npmjs.com/auth/cli/<uuid>`（你要的那种一次性授权链接；工作流会在 runner 里真正发起网页登录，无 TTY 时用 `script(1)` 提供伪终端）；
+2. `npm publish` 的 401 响应里的 `authUrl` / `Log in on <registry>` 语句（内网 registry 就给内网地址）；
+3. 兜底的 registry web-login 地址（由 `npm config get registry` 或 `NPM_REGISTRY` 拼出，可用 `NPM_LOGIN_URL` 覆盖）。
+
+**不同地址都会推送**（先导提示 + npm 的一次性链接是两条不同的地址，都会发给你）；**完全相同的地址只推一次**，不会重复打扰。
 
 ### 接收端配置（message-pusher 自定义 Webhook）
 

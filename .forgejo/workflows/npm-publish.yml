@@ -16,6 +16,10 @@
 # browser and the publish is retried automatically.
 # Repository secrets: MESSAGE_PUSHER_TOKEN (optional), FORGEJO_TOKEN (optional;
 # without it the Forgejo release step is skipped).
+# The login address is taken from npm itself: the workflow starts a web login so
+# npm prints its one-time auth/cli/<uuid> URL, relays it, and retries publishing
+# once the browser flow completed. NPM_REGISTRY / NPM_LOGIN_URL override the
+# address, NPM_AUTH_WAIT_MINUTES and NPM_LOGIN_POLL_MINUTES bound the waiting.
 # Repository variable MESSAGE_PUSHER_URL is REQUIRED — the webhook destination is
 # deliberately not shipped with the Action, so each repository supplies its own.
 # Other optional variables: NOTIFY_REQUIRED, NOTIFY_TITLE_REPO_ONLY,
@@ -167,31 +171,44 @@ jobs:
           stage="$RUNNER_TEMP/npm-publish"
           cat > "$stage/verification-parse.mjs" <<'VERIFICATION_PARSE_JS'
           // >>> verification-parse
-          // npm prints the second-factor URL in the middle of a long notice block. Two
-          // layouts exist: the modern `auth/cli/<uuid>` challenge (the URL can carry the
-          // one-time code as a query parameter) and the older browser-login prompt where
-          // the code is printed separately. The match stops at whitespace and obvious
-          // punctuation so markdown or JSON quoting around the link cannot leak into the
-          // forwarded URL.
+          // Extract the URL npm tells the user to open, from whatever npm printed.
+          //
+          // npm's wording differs per registry and per failure: the hosted registry emits a
+          // modern `auth/cli/<uuid>` challenge, a `401` body can carry an `authUrl` field,
+          // and a custom/internal registry only appears in a `Log in on <registry>` notice.
+          // The relay must forward *npm's own* URL (internal registry included), never a
+          // made-up npmjs.com page.
           export const VERIFICATION_PATTERNS = [
-            { kind: 'npm-2fa', re: /https:\/\/www\.npmjs\.com\/auth\/cli\/[^\s'"<>()\[\]*`]+/g },
-            { kind: 'npm-2fa', re: /https:\/\/www\.npmjs\.com\/login\/[^\s'"<>()\[\]*`]+/g },
-            { kind: 'npm-2fa', re: /https:\/\/[^\s'"<>()\[\]*`]*\/auth\/cli\/[^\s'"<>()\[\]*`]*/g },
-            {
-              kind: 'npm-login-required',
-              re: /https:\/\/[^\s'"<>()\[\]*`]*npmjs\.(?:com|org)\/(?:login|auth|signup)[^\s'"<>()\[\]*`]*/g,
-            },
-            // Unauthenticated publish: npm prints a `Log in on <registry>` notice plus
-            // a link, and the 401 body can carry an `authUrl` field.
-            {
-              kind: 'npm-login-required',
-              re: /"authUrl"\s*:\s*"(https:[^"]+)"/g,
-            },
-            {
-              kind: 'npm-login-required',
-              re: /https:\/\/[^\s'"<>()\[\]*`]+\/(?:login|signin|auth)[^\s'"<>()\[\]*`]*/g,
-            },
+            { kind: 'npm-2fa', re: /"authUrl"\s*:\s*"(https?:[^"]+)"/g },
+            { kind: 'npm-2fa', re: /https:\/\/[^\s'"<>()\[\]*`\x00-\x1f]*\/auth\/cli\/[^\s'"<>()\[\]*`\x00-\x1f]*/g },
+            { kind: 'npm-2fa', re: /https:\/\/www\.npmjs\.com\/auth\/cli\/[^\s'"<>()\[\]*`\x00-\x1f]+/g },
+            { kind: 'npm-login-required', re: /https:\/\/www\.npmjs\.com\/(?:login|signup)[^\s'"<>()\[\]*`\x00-\x1f]*/g },
+            { kind: 'npm-login-required', re: /"loginUrl"\s*:\s*"(https?:[^"]+)"/g },
+            { kind: 'npm-login-required', re: /https?:\/\/[^\s'"<>()\[\]*`\x00-\x1f]+\/(?:login|signin|weblogin|web-login|auth)[^\s'"<>()\[\]*`\x00-\x1f]*/g },
           ];
+
+          /**
+           * `Log in on <registry>` / `Log in at <url>` style notices: take the token after
+           * the keyword, so a bare registry origin (no /login path) is still forwarded.
+           */
+          /**
+           * `Log in on <registry>` / `Log in at <url>` notices. npm writes "Log in" as
+           * two words, so both spellings are accepted, and the token after the keyword is
+           * taken verbatim: a bare registry origin (no /login path) is still a usable URL.
+           */
+          /**
+           * `Log in on <registry>` / `Log in at <url>` notices. npm writes "Log in" as
+           * TWO words, which a token comparison misses — hence the joined-text match. The
+           * token after the preposition is taken verbatim, so a bare registry origin (with
+           * no /login path) is still a usable URL.
+           */
+          export function registryLoginUrl(text) {
+            const cleaned = String(text || '').replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '').replace(/\r/g, '');
+            const match = /(?:^|\s)log\s*[-]?\s*in\s+(?:on|at|to|using|via)\s+(\S+)/i.exec(cleaned);
+            if (!match) return '';
+            const candidate = match[1].replace(/[),.;'"]+$/, '');
+            return /^https?:\/\//.test(candidate) ? candidate : '';
+          }
 
           export function extractVerificationCode(text) {
             const labelled = /one[\s-]?tim(?:e|\s)?\s*password\s*(?:is)?\s*[:：]?\s*([0-9]{6,8})\b/i.exec(text || '');
@@ -204,26 +221,45 @@ jobs:
           }
 
           export function parseNpmAuthOutput(text) {
-            const source = String(text || '');
-            const matches = [];
+            const source = String(text || '')
+              .replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '')
+              .replace(/\r/g, '');
+            const candidates = [];
+            const push = (url, kind, priority) => {
+              if (!url || !/^https?:\/\//.test(url)) return;
+              if (candidates.some((entry) => entry.url === url)) return;
+              candidates.push({ url, kind, priority });
+            };
+
             for (const pattern of VERIFICATION_PATTERNS) {
               for (const match of source.matchAll(pattern.re)) {
-                if (!matches.includes(match[0])) matches.push(match[0]);
+                // `"authUrl": "…"` / `"loginUrl": "…"` capture the URL in group 1; prose
+                // patterns match the whole URL.
+                push(match[1] || match[0], pattern.kind, pattern.kind === 'npm-2fa' ? 10 : 20);
               }
             }
-            const url = matches.find((candidate) => candidate.includes('/auth/cli/')) || matches[0] || '';
-            // A login link is only a plain sign-in prompt when nothing in the output
-            // mentions a second factor. npm prints `EOTP`/`one-time password` both for the
-            // modern challenge URL and for the older browser-login prompt.
+            // A /login path is a stronger signal than a bare registry origin.
+            for (const candidate of candidates) {
+              if (/\/(?:login|signin|weblogin|web-login|auth)/i.test(candidate.url)) candidate.priority -= 5;
+              if (candidate.url.includes('/auth/cli/')) candidate.priority -= 5;
+            }
+            const fromNotice = registryLoginUrl(source);
+            if (fromNotice) push(fromNotice, 'npm-login-required', 30);
+
+            candidates.sort((a, b) => a.priority - b.priority);
+            const chosen = candidates[0] || { url: '', kind: '' };
+            const code = extractVerificationCode(source);
             const mentionsSecondFactor =
-              url.includes('/auth/cli/') ||
-              url.includes('/login/') ||
-              url.includes('/auth/') ||
+              Boolean(code) ||
+              chosen.kind === 'npm-2fa' ||
+              chosen.url.includes('/auth/cli/') ||
+              chosen.url.includes('/login/') ||
+              chosen.url.includes('/auth/') ||
               /\beotp\b|one[\s-]?time password|verification code/i.test(source);
             return {
-              url,
-              code: extractVerificationCode(source),
-              kind: url ? (mentionsSecondFactor ? 'npm-2fa' : 'npm-login-required') : '',
+              url: chosen.url,
+              code,
+              kind: chosen.url ? (mentionsSecondFactor ? 'npm-2fa' : 'npm-login-required') : '',
             };
           }
           // <<< verification-parse
@@ -582,26 +618,75 @@ jobs:
           import { buildPayload, deliver, errorSummary, readOptional } from './notify-lib.mjs';
           import { parseNpmAuthOutput } from './verification-parse.mjs';
 
-          export const IS_DIRECT = String(process.argv[1] || '').endsWith('publish.mjs');
-          export const REGISTRY = 'https://registry.npmjs.org';
-          export const LOGIN_URL = 'https://www.npmjs.com/login';
+            export const IS_DIRECT = String(process.argv[1] || '').endsWith('publish.mjs');
 
-          /** `npm whoami` is the cheapest authentication probe available to us. */
-          export function isAuthenticated(run) {
-            const result = run('npm', ['whoami'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
-            return result.status === 0 && String(result.stdout || '').trim() !== '';
+            /** `npm whoami` is the cheapest authentication probe available to us. */
+            export function isAuthenticated(run) {
+              const result = run('npm', ['whoami'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+              return result.status === 0 && String(result.stdout || '').trim() !== '';
+            }
+
+            /**
+             * The registry npm is configured to publish to. An internal mirror matters:
+             * the login URL must point at *that* registry, not at a hardcoded npmjs.com page.
+             */
+            export function resolveRegistry(run) {
+              const result = run('npm', ['config', 'get', 'registry'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+              const value = result.status === 0 ? String(result.stdout || '').trim() : '';
+              return /^https?:\/\//.test(value) ? value.replace(/\/+$/, '') : '';
+            }
+
+            /**
+             * Best usable login URL before npm has printed its own. NPM_LOGIN_URL wins,
+             * otherwise the configured registry's web-login endpoint. Returns '' when the
+             * registry is unknown, so the run stays quiet rather than sending an address
+             * unrelated to this registry.
+             */
+          /**
+           * Best usable login URL before npm has printed its own. NPM_LOGIN_URL wins,
+           * then NPM_REGISTRY or the registry from `npm config get registry`, joined with
+           * the web-login endpoint. Returns '' when the registry is unknown, so the run
+           * stays quiet rather than sending an address unrelated to this registry.
+           */
+          export function resolveLoginUrl(run) {
+            const override = String(process.env.NPM_LOGIN_URL || '').trim();
+            if (/^https?:\/\//.test(override)) return override;
+            const registry = resolveRegistry(run);
+            return registry ? `${registry}/-/web-login` : '';
+          }
+
+          /** The registry to authenticate against: NPM_REGISTRY, else npm config. */
+          export function targetRegistry(run) {
+            const override = String(process.env.NPM_REGISTRY || '').trim().replace(/\/+$/, '');
+            if (/^https?:\/\//.test(override)) return override;
+            return resolveRegistry(run);
+          }
+
+          /**
+           * npm prints its one-time `auth/cli/<uuid>` URL when it *starts* a web login.
+           * `npm publish` on a headless runner never starts one, so the workflow opens it
+           * explicitly: this is what produces the address the user completes in a browser.
+           * Without a TTY npm refuses; `script(1)` provides a pseudo-terminal when the
+           * image has it (node:22-bookworm does).
+           */
+          export function webLoginCommand(registry, usePty) {
+            const login = `npm login --auth-type=web${registry ? ` --registry=${registry}` : ''}`;
+            const env = 'BROWSER=true';
+            return usePty ? `${env} script -q -e -c ${JSON.stringify(login)} /dev/null` : `${env} ${login}`;
           }
 
           /** Run a command with piped stdio, streaming its output and keeping a tail. */
-          function runStreaming(command, args, { onChunk, env } = {}) {
-            return new Promise((resolve) => {
+          /** Run a command, streaming its output and returning the captured tail. */
+          function runStreaming(command, args, { env } = {}) {
+            return new Promise((resolveOutcome) => {
               const child = spawn(command, args, {
                 env: { ...process.env, ...env },
                 stdio: ['ignore', 'pipe', 'pipe'],
               });
+              let captured = '';
               const handle = (chunk) => {
                 process.stdout.write(chunk);
-                if (onChunk) onChunk(chunk);
+                captured = `${captured}${chunk}`.slice(-65_536);
               };
               child.stdout.setEncoding('utf8');
               child.stderr.setEncoding('utf8');
@@ -609,9 +694,9 @@ jobs:
               child.stderr.on('data', handle);
               child.on('error', (error) => {
                 process.stderr.write(`无法启动 ${command}：${error.message}\n`);
-                resolve(127);
+                resolveOutcome({ code: 127, output: captured });
               });
-              child.on('close', (code) => resolve(code ?? 1));
+              child.on('close', (code) => resolveOutcome({ code: code ?? 1, output: captured }));
             });
           }
 
@@ -627,21 +712,19 @@ jobs:
             const pkg = JSON.parse(readFileSync('package.json', 'utf8'));
             const state = { ...core, package: core.name || pkg.name };
             const waitMinutes = Number(process.env.NPM_AUTH_WAIT_MINUTES || 15);
+            // How long to keep polling `npm whoami` after starting the web login, so a
+            // completed browser login is noticed before the publish window runs out.
+            const LOGIN_POLL_MS = Number(process.env.NPM_LOGIN_POLL_MINUTES || 5) * 60_000;
             const deadline = Date.now() + waitMinutes * 60_000;
 
             const sleep = (ms) => new Promise((resolveWait) => setTimeout(resolveWait, ms));
             // Focus only on the fresh output of the current npm invocation when
             // searching for a URL: otherwise a stale link from a previous attempt would be
             // re-forwarded instead of the current one.
-            let scanning = false;
             let buffer = '';
             let announced = '';
             const clearBuffer = () => {
               buffer = '';
-            };
-            const feed = (chunk) => {
-              if (!scanning) return;
-              buffer = `${buffer}${chunk}`.slice(-65_536);
             };
 
             const announce = async (parsed, kind, reason) => {
@@ -668,18 +751,55 @@ jobs:
             };
 
             const spawnSyncSafe = (await import('node:child_process')).spawnSync;
+            const registry = resolveRegistry(spawnSyncSafe);
             const authenticated = isAuthenticated(spawnSyncSafe);
-            process.stdout.write(`npm 认证状态：${authenticated ? '已登录' : '未登录（需要人工授权）'}\n`);
+            process.stdout.write(
+              `npm 认证状态：${authenticated ? '已登录' : '未登录（需要人工授权）'}｜registry=${registry || '未知'}\n`,
+            );
             if (!authenticated && !state.dryRun) {
-              // npm cannot print a web-login URL without a TTY, so the first push tells the
-              // human where to sign in; the retry loop below reports the exact challenge
-              // URL once npm emits one.
-              await announce(
-                { url: LOGIN_URL, code: '', kind: 'npm-login-required' },
-                'npm-login-required',
-                '当前 runner 未登录 npm',
-              );
+              // npm cannot print a web-login URL without a TTY, so the first push points at
+              // the configured registry's login endpoint; the retry loop then forwards the
+              // exact URL npm prints (crucially including an internal registry).
+              const loginUrl = resolveLoginUrl(spawnSyncSafe);
+              if (loginUrl) {
+                await announce(
+                  { url: loginUrl, code: '', kind: 'npm-login-required' },
+                  'npm-login-required',
+                  '当前 runner 未登录 npm',
+                );
+              } else {
+                process.stdout.write('未取到 registry 地址，跳过登录提示（等 npm publish 自己输出网址）\n');
+              }
             }
+
+          // npm only prints its one-time `auth/cli/<uuid>` URL while it is running a web
+          // login, so start one before publishing. This is the address the user opens.
+          if (!authenticated && !state.dryRun) {
+            const registry = targetRegistry(spawnSyncSafe);
+            const usePty = spawnSyncSafe('sh', ['-c', 'command -v script'], { encoding: 'utf8' }).status === 0;
+            const command = webLoginCommand(registry, usePty);
+            process.stdout.write(`尝试网页登录（${usePty ? 'PTY' : '无 PTY'}）：${command}\n`);
+            const loginResult = await runStreaming('sh', ['-c', command], {
+              env: { BROWSER: 'true', npm_config_userconfig: join(temp, 'npmrc') },
+            });
+            buffer = loginResult.output;
+            const parsedLogin = parseNpmAuthOutput(buffer);
+            if (parsedLogin.url) {
+              await announce(parsedLogin, parsedLogin.kind || 'npm-login-required', 'npm 已发起网页登录');
+            } else {
+              process.stdout.write('网页登录没有打印可用网址，改由 npm publish 自己报告\n');
+            }
+            // Give the human time to finish in the browser before publishing.
+            let waited = 0;
+            while (waited < LOGIN_POLL_MS && Date.now() < deadline) {
+              await sleep(5000);
+              waited += 5000;
+              if (isAuthenticated(spawnSyncSafe)) {
+                process.stdout.write('检测到 npm 已登录，继续发布\n');
+                break;
+              }
+            }
+          }
 
             const baseArgs = ['publish', '--access', 'public', '--tag', state.distTag];
             if (state.dryRun) baseArgs.push('--dry-run');
@@ -689,27 +809,24 @@ jobs:
             // `--otp` is taken from the manual input when provided, otherwise from
             // the code npm embedded in a previous challenge URL.
             let discoveredOtp = '';
-            while (attempt < 6) {
+            const maxAttempts = Math.max(1, Number(process.env.NPM_MAX_ATTEMPTS || 6));
+            while (attempt < maxAttempts) {
               attempt += 1;
               const args = [...baseArgs];
               const otp = readOptional(process.env.INPUT_OTP) || discoveredOtp;
               if (otp) args.push('--otp', otp);
               process.stdout.write(`第 ${attempt} 次运行：npm ${args.join(' ')}\n`);
 
-              scanning = true;
               clearBuffer();
-              lastExit = await runStreaming('npm', args, {
+              const attemptResult = await runStreaming('npm', args, {
                 env: { npm_config_git_checks: 'false' },
-                onChunk: (chunk) => {
-                  feed(chunk);
-                  const parsed = parseNpmAuthOutput(buffer);
-                  if (parsed.url) {
-                    scanning = false;
-                    void announce(parsed, parsed.kind || 'npm-2fa', 'npm 要求完成认证');
-                  }
-                },
               });
-              scanning = false;
+              lastExit = attemptResult.code;
+              buffer = attemptResult.output;
+              const attemptAuth = parseNpmAuthOutput(buffer);
+              if (attemptAuth.url) {
+                await announce(attemptAuth, attemptAuth.kind || 'npm-2fa', 'npm 要求完成认证');
+              }
 
               if (state.dryRun) break;
 

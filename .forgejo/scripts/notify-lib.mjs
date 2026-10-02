@@ -265,8 +265,15 @@ function toMessagePusherBody(payload, config) {
   };
 }
 
-function idempotencyPath(config, requestId) {
-  return join(config.stateDir, `notify-${String(requestId).replace(/[^\w.-]+/g, '_')}.json`);
+/**
+ * One marker per (request, url): a run can legitimately deliver several different
+ * authentication URLs (the derived login page first, then npm's one-time
+ * `auth/cli/<uuid>` challenge), and keying on the request id alone silently
+ * dropped the second one — the address the user actually needs.
+ */
+function idempotencyPath(config, requestId, url) {
+  const key = `${requestId}|${url}`.replace(/[^\w.-]+/g, '_');
+  return join(config.stateDir, `notify-${key.slice(0, 120)}.json`);
 }
 
 async function attemptDelivery(payload, config, fetchImpl) {
@@ -324,11 +331,11 @@ export async function deliver(payload, options = {}) {
     throw new Error('未配置 MESSAGE_PUSHER_URL，无法投递通知');
   }
   const idempotent = options.idempotent !== false;
-  const marker = idempotencyPath(config, payload.request_id);
+  const marker = idempotencyPath(config, payload.request_id, payload.url);
 
   if (idempotent && options.force !== true && existsSync(marker)) {
     const previous = readFileSync(marker, 'utf8').trim();
-    return { skipped: true, reason: `already delivered for request_id ${payload.request_id}`, previous };
+    return { skipped: true, reason: `already delivered ${payload.request_id} → ${payload.url}`, previous };
   }
 
   const fetchImpl = options.fetchImpl || globalThis.fetch;
