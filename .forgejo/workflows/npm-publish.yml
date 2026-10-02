@@ -149,85 +149,85 @@ jobs:
           set -euo pipefail
           stage="$RUNNER_TEMP/npm-publish"
           cat > "$stage/resolve.mjs" <<'RESOLVE_JS'
-// >>> resolve
-import { appendFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+                   // >>> resolve
+                   import { appendFileSync, writeFileSync } from 'node:fs';
+                   import { join } from 'node:path';
 
-export const SEMVER = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z.-]+)?$/;
-export const IS_DIRECT = String(process.argv[1] || '').endsWith('resolve.mjs');
+                   export const SEMVER = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z.-]+)?$/;
+                   export const IS_DIRECT = String(process.argv[1] || '').endsWith('resolve.mjs');
 
-export function stripTagPrefix(tag) {
-  let value = String(tag || '').trim();
-  if (value.startsWith('refs/tags/')) value = value.slice('refs/tags/'.length);
-  if (value.startsWith('v')) value = value.slice(1);
-  return value;
-}
+                   export function stripTagPrefix(tag) {
+           let value = String(tag || '').trim();
+           if (value.startsWith('refs/tags/')) value = value.slice('refs/tags/'.length);
+           if (value.startsWith('v')) value = value.slice(1);
+           return value;
+                   }
 
-export function tagVersionFromRef(ref) {
-  const match = /^refs\/tags\/(.+)$/.exec(ref || '');
-  return match ? match[1] : '';
-}
+                   export function tagVersionFromRef(ref) {
+           const match = /^refs\/tags\/(.+)$/.exec(ref || '');
+           return match ? match[1] : '';
+                   }
 
-/**
- * Derive the release identity from the environment. Throws when the tag cannot
- * be parsed or when a hand-typed version disagrees with the tag that triggered
- * the run, so a mistyped manual dispatch can never publish the wrong version.
- */
-export function resolveRelease(env = process.env) {
-  const rawTag = env.INPUT_VERSION || env.GITHUB_REF_NAME || tagVersionFromRef(env.GITHUB_REF);
-  const version = stripTagPrefix(rawTag);
-  if (!SEMVER.test(version)) throw new Error(`无法从 tag 解析出合法版本号：${rawTag || '<empty>'}`);
-  if (env.INPUT_VERSION && stripTagPrefix(env.INPUT_VERSION) !== stripTagPrefix(env.GITHUB_REF_NAME || '')) {
-    throw new Error(
-      `手工输入的版本（${env.INPUT_VERSION}）与触发 ref（${env.GITHUB_REF_NAME || '<none>'}）不一致，已中止以避免误发`,
-    );
-  }
+                   /**
+          * Derive the release identity from the environment. Throws when the tag cannot
+          * be parsed or when a hand-typed version disagrees with the tag that triggered
+          * the run, so a mistyped manual dispatch can never publish the wrong version.
+          */
+                   export function resolveRelease(env = process.env) {
+           const rawTag = env.INPUT_VERSION || env.GITHUB_REF_NAME || tagVersionFromRef(env.GITHUB_REF);
+           const version = stripTagPrefix(rawTag);
+           if (!SEMVER.test(version)) throw new Error(`无法从 tag 解析出合法版本号：${rawTag || '<empty>'}`);
+           if (env.INPUT_VERSION && stripTagPrefix(env.INPUT_VERSION) !== stripTagPrefix(env.GITHUB_REF_NAME || '')) {
+             throw new Error(
+               `手工输入的版本（${env.INPUT_VERSION}）与触发 ref（${env.GITHUB_REF_NAME || '<none>'}）不一致，已中止以避免误发`,
+             );
+           }
 
-  const prerelease = version.includes('-');
-  const repo = env.GITHUB_REPOSITORY || '';
-  const serverUrl = env.GITHUB_SERVER_URL || '';
-  const runNumber = env.GITHUB_RUN_NUMBER || '';
-  return {
-    version,
-    tag: rawTag,
-    prerelease,
-    distTag: env.INPUT_DIST_TAG || env.RELEASE_DIST_TAG || (prerelease ? 'next' : 'latest'),
-    dryRun: String(env.INPUT_DRY_RUN || '').toLowerCase() === 'true',
-    repo,
-    title: repo.split('/').pop() || repo || 'unknown',
-    runUrl: `${serverUrl}/${repo}/actions/runs/${runNumber}`,
-    runNumber,
-    runAttempt: env.GITHUB_RUN_ATTEMPT || '',
-    eventName: env.GITHUB_EVENT_NAME || '',
-    sha: env.GITHUB_SHA || '',
-    serverUrl,
-    apiUrl: env.GITHUB_API_URL || `${serverUrl}/api/v1`,
-    refName: env.GITHUB_REF_NAME || '',
-  };
-}
+           const prerelease = version.includes('-');
+           const repo = env.GITHUB_REPOSITORY || '';
+           const serverUrl = env.GITHUB_SERVER_URL || '';
+           const runNumber = env.GITHUB_RUN_NUMBER || '';
+           return {
+             version,
+             tag: rawTag,
+             prerelease,
+             distTag: env.INPUT_DIST_TAG || env.RELEASE_DIST_TAG || (prerelease ? 'next' : 'latest'),
+             dryRun: String(env.INPUT_DRY_RUN || '').toLowerCase() === 'true',
+             repo,
+             title: repo.split('/').pop() || repo || 'unknown',
+             runUrl: `${serverUrl}/${repo}/actions/runs/${runNumber}`,
+             runNumber,
+             runAttempt: env.GITHUB_RUN_ATTEMPT || '',
+             eventName: env.GITHUB_EVENT_NAME || '',
+             sha: env.GITHUB_SHA || '',
+             serverUrl,
+             apiUrl: env.GITHUB_API_URL || `${serverUrl}/api/v1`,
+             refName: env.GITHUB_REF_NAME || '',
+           };
+                   }
 
-if (IS_DIRECT) {
-  const temp = process.env.RUNNER_TEMP || '/tmp';
-  const state = resolveRelease();
-  writeFileSync(join(temp, 'release.json'), JSON.stringify(state, null, 2));
+                   if (IS_DIRECT) {
+           const temp = process.env.RUNNER_TEMP || '/tmp';
+           const state = resolveRelease();
+           writeFileSync(join(temp, 'release.json'), JSON.stringify(state, null, 2));
 
-  const emit = (key, value) => {
-    if (process.env.GITHUB_OUTPUT) appendFileSync(process.env.GITHUB_OUTPUT, `${key}=${value}\n`);
-    process.stdout.write(`${key}=${value}\n`);
-  };
-  emit('version', state.version);
-  emit('dist_tag', state.distTag);
-  emit('prerelease', String(state.prerelease));
-  emit('dry_run', String(state.dryRun));
-  emit('title', state.title);
-  emit('run_url', state.runUrl);
-  process.stdout.write(
-    `tag=${state.tag} version=${state.version} dist-tag=${state.distTag} prerelease=${state.prerelease} dry-run=${state.dryRun}\n`,
-  );
-  process.stdout.write(`event=${state.eventName} run=${state.runNumber} attempt=${state.runAttempt} sha=${state.sha}\n`);
-}
-// <<< resolve
-RESOLVE_JS
+           const emit = (key, value) => {
+             if (process.env.GITHUB_OUTPUT) appendFileSync(process.env.GITHUB_OUTPUT, `${key}=${value}\n`);
+             process.stdout.write(`${key}=${value}\n`);
+           };
+           emit('version', state.version);
+           emit('dist_tag', state.distTag);
+           emit('prerelease', String(state.prerelease));
+           emit('dry_run', String(state.dryRun));
+           emit('title', state.title);
+           emit('run_url', state.runUrl);
+           process.stdout.write(
+             `tag=${state.tag} version=${state.version} dist-tag=${state.distTag} prerelease=${state.prerelease} dry-run=${state.dryRun}\n`,
+           );
+           process.stdout.write(`event=${state.eventName} run=${state.runNumber} attempt=${state.runAttempt} sha=${state.sha}\n`);
+                   }
+                   // <<< resolve
+          RESOLVE_JS
           cd "$GITHUB_WORKSPACE${PKG_TARGET_DIR:+/$PKG_TARGET_DIR}"
           node "$stage/resolve.mjs"
 
@@ -236,129 +236,129 @@ RESOLVE_JS
           set -euo pipefail
           stage="$RUNNER_TEMP/npm-publish"
           cat > "$stage/preflight.mjs" <<'PREFLIGHT_JS'
-// >>> preflight
-import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
-import { spawnSync } from 'node:child_process';
-import { assertNotifyConfigured, buildPayload, deliver, semverGt, errorSummary } from './notify-lib.mjs';
+                   // >>> preflight
+                   import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
+                   import { join } from 'node:path';
+                   import { spawnSync } from 'node:child_process';
+                   import { assertNotifyConfigured, buildPayload, deliver, semverGt, errorSummary } from './notify-lib.mjs';
 
-export const IS_DIRECT = String(process.argv[1] || '').endsWith('preflight.mjs');
+                   export const IS_DIRECT = String(process.argv[1] || '').endsWith('preflight.mjs');
 
-export function missingArtifacts(required, exists = existsSync) {
-  return required.filter((item) => !exists(item));
-}
+                   export function missingArtifacts(required, exists = existsSync) {
+           return required.filter((item) => !exists(item));
+                   }
 
-export function parseRequiredArtifacts(raw) {
-  return String(raw ?? 'lib/index.js,lib/client.js,cordis.patch.yml')
-    .split(',')
-    .map((item) => item.trim())
-    .filter(Boolean);
-}
+                   export function parseRequiredArtifacts(raw) {
+           return String(raw ?? 'lib/index.js,lib/client.js,cordis.patch.yml')
+             .split(',')
+             .map((item) => item.trim())
+             .filter(Boolean);
+                   }
 
-export function npmViewJson(spec, run = spawnSync) {
-  const result = run('npm', ['view', spec, '--json'], { encoding: 'utf8' });
-  if (result.status !== 0) return { ok: false, value: null, stderr: result.stderr || '' };
-  try {
-    return { ok: true, value: JSON.parse(result.stdout), stderr: '' };
-  } catch {
-    return { ok: true, value: result.stdout.trim(), stderr: '' };
-  }
-}
+                   export function npmViewJson(spec, run = spawnSync) {
+           const result = run('npm', ['view', spec, '--json'], { encoding: 'utf8' });
+           if (result.status !== 0) return { ok: false, value: null, stderr: result.stderr || '' };
+           try {
+             return { ok: true, value: JSON.parse(result.stdout), stderr: '' };
+           } catch {
+             return { ok: true, value: result.stdout.trim(), stderr: '' };
+           }
+                   }
 
-export function publishedVersions(view) {
-  if (!view.ok) return null;
-  return (Array.isArray(view.value) ? view.value : [view.value]).filter((item) => typeof item === 'string');
-}
+                   export function publishedVersions(view) {
+           if (!view.ok) return null;
+           return (Array.isArray(view.value) ? view.value : [view.value]).filter((item) => typeof item === 'string');
+                   }
 
-/**
- * Resolve the commit a local tag points at. `rev-parse refs/tags/X` yields the
- * annotated tag object itself, so peel with `^{commit}` and fall back to the
- * raw object name for lightweight tags when peeling is unavailable.
- */
-export function resolveTagCommit(tag, run = spawnSync) {
-  const peeled = run('git', ['rev-parse', `refs/tags/${tag}^{commit}`], { encoding: 'utf8' });
-  if (peeled.status === 0 && peeled.stdout.trim()) return peeled.stdout.trim();
-  const raw = run('git', ['rev-parse', `refs/tags/${tag}`], { encoding: 'utf8' });
-  return raw.status === 0 ? raw.stdout.trim() : '';
-}
+                   /**
+          * Resolve the commit a local tag points at. `rev-parse refs/tags/X` yields the
+          * annotated tag object itself, so peel with `^{commit}` and fall back to the
+          * raw object name for lightweight tags when peeling is unavailable.
+          */
+                   export function resolveTagCommit(tag, run = spawnSync) {
+           const peeled = run('git', ['rev-parse', `refs/tags/${tag}^{commit}`], { encoding: 'utf8' });
+           if (peeled.status === 0 && peeled.stdout.trim()) return peeled.stdout.trim();
+           const raw = run('git', ['rev-parse', `refs/tags/${tag}`], { encoding: 'utf8' });
+           return raw.status === 0 ? raw.stdout.trim() : '';
+                   }
 
-async function main() {
-  const temp = process.env.RUNNER_TEMP || '/tmp';
-  const corePath = join(temp, 'release.json');
-  const core = JSON.parse(readFileSync(corePath, 'utf8'));
+                   async function main() {
+           const temp = process.env.RUNNER_TEMP || '/tmp';
+           const corePath = join(temp, 'release.json');
+           const core = JSON.parse(readFileSync(corePath, 'utf8'));
 
-  const fail = async (reason) => {
-    process.stderr.write(`${reason}\n`);
-    if (!core.dryRun) {
-      try {
-        await deliver(buildPayload({ phase: 'failed', core, reason }));
-      } catch (error) {
-        process.stderr.write(`失败通知也未投递成功：${errorSummary(error)}\n`);
-      }
-    }
-    process.exit(1);
-  };
+           const fail = async (reason) => {
+             process.stderr.write(`${reason}\n`);
+             if (!core.dryRun) {
+               try {
+                 await deliver(buildPayload({ phase: 'failed', core, reason }));
+               } catch (error) {
+                 process.stderr.write(`失败通知也未投递成功：${errorSummary(error)}\n`);
+               }
+             }
+             process.exit(1);
+           };
 
-  const pkg = JSON.parse(readFileSync('package.json', 'utf8'));
-  if (pkg.private === true) await fail('package.json 标记为 private: true，不允许发布');
-  if (!pkg.name) await fail('package.json 缺少 name');
-  if (pkg.version !== core.version) {
-    process.stdout.write(`提示：package.json 版本 ${pkg.version} 与 tag 版本 ${core.version} 不一致，prepare 步骤会对齐（不提交）\n`);
-  }
+           const pkg = JSON.parse(readFileSync('package.json', 'utf8'));
+           if (pkg.private === true) await fail('package.json 标记为 private: true，不允许发布');
+           if (!pkg.name) await fail('package.json 缺少 name');
+           if (pkg.version !== core.version) {
+             process.stdout.write(`提示：package.json 版本 ${pkg.version} 与 tag 版本 ${core.version} 不一致，prepare 步骤会对齐（不提交）\n`);
+           }
 
-  const missing = missingArtifacts(parseRequiredArtifacts(process.env.REQUIRED_ARTIFACTS));
-  if (missing.length > 0) await fail(`构建产物缺失：${missing.join(', ')}`);
+           const missing = missingArtifacts(parseRequiredArtifacts(process.env.REQUIRED_ARTIFACTS));
+           if (missing.length > 0) await fail(`构建产物缺失：${missing.join(', ')}`);
 
-  const tagSha = resolveTagCommit(core.tag);
-  if (!tagSha) await fail(`本地不存在 tag ${core.tag}`);
-  if (core.sha && tagSha !== core.sha) {
-    await fail(`tag ${core.tag} 指向 ${tagSha}，与本次运行的 ${core.sha} 不一致（tag 可能已被移动）`);
-  }
+           const tagSha = resolveTagCommit(core.tag);
+           if (!tagSha) await fail(`本地不存在 tag ${core.tag}`);
+           if (core.sha && tagSha !== core.sha) {
+             await fail(`tag ${core.tag} 指向 ${tagSha}，与本次运行的 ${core.sha} 不一致（tag 可能已被移动）`);
+           }
 
-  if (!process.env.NPM_TOKEN) await fail('缺少 NPM_TOKEN secret，请先在仓库 secrets 中配置发布令牌');
+           if (!process.env.NPM_TOKEN) await fail('缺少 NPM_TOKEN secret，请先在仓库 secrets 中配置发布令牌');
 
-  // Notification is the only path by which a human can finish an npm
-  // second-factor challenge, so a missing destination is a hard error rather
-  // than a silent skip.
-  try {
-    assertNotifyConfigured(process.env);
-  } catch (error) {
-    await fail(error.message);
-  }
+           // Notification is the only path by which a human can finish an npm
+           // second-factor challenge, so a missing destination is a hard error rather
+           // than a silent skip.
+           try {
+             assertNotifyConfigured(process.env);
+           } catch (error) {
+             await fail(error.message);
+           }
 
-  const state = { ...core, name: pkg.name };
-  const versions = publishedVersions(npmViewJson(`${pkg.name} versions`));
-  if (versions === null) {
-    process.stdout.write(`registry 上查不到 ${pkg.name}，按首次发布处理\n`);
-  } else {
-    if (versions.includes(core.version)) {
-      // Idempotent no-op: the version is already live, so this is a success and
-      // deliberately silent — re-triggering a tag must not spam the chat.
-      process.stdout.write(`registry 上已存在 ${pkg.name}@${core.version}，本次为空操作\n`);
-      process.exit(0);
-    }
-    const latest = versions[versions.length - 1];
-    if (latest && !semverGt(core.version, latest)) {
-      await fail(`版本必须严格大于 registry 上最新版：${core.version} 不大于 ${latest}`);
-    }
-    if (latest) process.stdout.write(`registry 最新版 ${latest} → 本次 ${core.version}\n`);
-  }
+           const state = { ...core, name: pkg.name };
+           const versions = publishedVersions(npmViewJson(`${pkg.name} versions`));
+           if (versions === null) {
+             process.stdout.write(`registry 上查不到 ${pkg.name}，按首次发布处理\n`);
+           } else {
+             if (versions.includes(core.version)) {
+               // Idempotent no-op: the version is already live, so this is a success and
+               // deliberately silent — re-triggering a tag must not spam the chat.
+               process.stdout.write(`registry 上已存在 ${pkg.name}@${core.version}，本次为空操作\n`);
+               process.exit(0);
+             }
+             const latest = versions[versions.length - 1];
+             if (latest && !semverGt(core.version, latest)) {
+               await fail(`版本必须严格大于 registry 上最新版：${core.version} 不大于 ${latest}`);
+             }
+             if (latest) process.stdout.write(`registry 最新版 ${latest} → 本次 ${core.version}\n`);
+           }
 
-  writeFileSync(corePath, JSON.stringify(state, null, 2));
-  if (process.env.GITHUB_OUTPUT) appendFileSync(process.env.GITHUB_OUTPUT, `name=${pkg.name}\n`);
-  process.stdout.write(`预检通过：${pkg.name}@${core.version}（dist-tag=${core.distTag}）\n`);
-}
+           writeFileSync(corePath, JSON.stringify(state, null, 2));
+           if (process.env.GITHUB_OUTPUT) appendFileSync(process.env.GITHUB_OUTPUT, `name=${pkg.name}\n`);
+           process.stdout.write(`预检通过：${pkg.name}@${core.version}（dist-tag=${core.distTag}）\n`);
+                   }
 
-if (IS_DIRECT) {
-  try {
-    await main();
-  } catch (error) {
-    process.stderr.write(`预检异常：${errorSummary(error)}\n`);
-    process.exit(1);
-  }
-}
-// <<< preflight
-PREFLIGHT_JS
+                   if (IS_DIRECT) {
+           try {
+             await main();
+           } catch (error) {
+             process.stderr.write(`预检异常：${errorSummary(error)}\n`);
+             process.exit(1);
+           }
+                   }
+                   // <<< preflight
+          PREFLIGHT_JS
           cd "$GITHUB_WORKSPACE${PKG_TARGET_DIR:+/$PKG_TARGET_DIR}"
           node "$stage/preflight.mjs"
 
@@ -385,79 +385,79 @@ PREFLIGHT_JS
           set -euo pipefail
           stage="$RUNNER_TEMP/npm-publish"
           cat > "$stage/prepare.mjs" <<'PREPARE_JS'
-// >>> prepare
-import { readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
-import { spawnSync } from 'node:child_process';
-import { buildPayload, deliver, errorSummary } from './notify-lib.mjs';
+                  // >>> prepare
+                  import { readFileSync, writeFileSync } from 'node:fs';
+                  import { join } from 'node:path';
+                  import { spawnSync } from 'node:child_process';
+                  import { buildPayload, deliver, errorSummary } from './notify-lib.mjs';
 
-export const IS_DIRECT = String(process.argv[1] || '').endsWith('prepare.mjs');
+                  export const IS_DIRECT = String(process.argv[1] || '').endsWith('prepare.mjs');
 
-export function firstTarballFromPack(stdout) {
-  const parsed = JSON.parse(stdout);
-  const manifest = Array.isArray(parsed) ? parsed[0] : parsed;
-  return { filename: manifest?.filename || '', size: Number(manifest?.size || 0) };
-}
+                  export function firstTarballFromPack(stdout) {
+          const parsed = JSON.parse(stdout);
+          const manifest = Array.isArray(parsed) ? parsed[0] : parsed;
+          return { filename: manifest?.filename || '', size: Number(manifest?.size || 0) };
+                  }
 
-export function sha256Of(file, run = spawnSync) {
-  if (!file) return '';
-  const digest = run('sha256sum', [file], { encoding: 'utf8' });
-  return digest.status === 0 ? digest.stdout.trim().split(/\s+/)[0] || '' : '';
-}
+                  export function sha256Of(file, run = spawnSync) {
+          if (!file) return '';
+          const digest = run('sha256sum', [file], { encoding: 'utf8' });
+          return digest.status === 0 ? digest.stdout.trim().split(/\s+/)[0] || '' : '';
+                  }
 
-async function main() {
-  const temp = process.env.RUNNER_TEMP || '/tmp';
-  const corePath = join(temp, 'release.json');
-  const core = JSON.parse(readFileSync(corePath, 'utf8'));
+                  async function main() {
+          const temp = process.env.RUNNER_TEMP || '/tmp';
+          const corePath = join(temp, 'release.json');
+          const core = JSON.parse(readFileSync(corePath, 'utf8'));
 
-  const versioned = spawnSync('npm', ['version', core.version, '--no-git-tag-version', '--allow-same-version'], {
-    encoding: 'utf8',
-    env: { ...process.env, npm_config_git_checks: 'false' },
-  });
-  if (versioned.status !== 0) {
-    process.stderr.write(`npm version 失败：\n${versioned.stderr || versioned.stdout}\n`);
-    process.exit(1);
-  }
+          const versioned = spawnSync('npm', ['version', core.version, '--no-git-tag-version', '--allow-same-version'], {
+            encoding: 'utf8',
+            env: { ...process.env, npm_config_git_checks: 'false' },
+          });
+          if (versioned.status !== 0) {
+            process.stderr.write(`npm version 失败：\n${versioned.stderr || versioned.stdout}\n`);
+            process.exit(1);
+          }
 
-  const packed = spawnSync('npm', ['pack', '--json'], { encoding: 'utf8' });
-  if (packed.status !== 0) {
-    process.stderr.write(`npm pack 失败：\n${packed.stderr || packed.stdout}\n`);
-    process.exit(1);
-  }
+          const packed = spawnSync('npm', ['pack', '--json'], { encoding: 'utf8' });
+          if (packed.status !== 0) {
+            process.stderr.write(`npm pack 失败：\n${packed.stderr || packed.stdout}\n`);
+            process.exit(1);
+          }
 
-  let tarball;
-  try {
-    tarball = firstTarballFromPack(packed.stdout);
-  } catch (error) {
-    process.stderr.write(`无法解析 npm pack 输出：${error.message}\n`);
-    process.exit(1);
-  }
-  const sha256 = sha256Of(tarball.filename);
+          let tarball;
+          try {
+            tarball = firstTarballFromPack(packed.stdout);
+          } catch (error) {
+            process.stderr.write(`无法解析 npm pack 输出：${error.message}\n`);
+            process.exit(1);
+          }
+          const sha256 = sha256Of(tarball.filename);
 
-  const state = { ...core, tarball: tarball.filename, tarball_bytes: tarball.size, tarball_sha256: sha256 };
-  writeFileSync(corePath, JSON.stringify(state, null, 2));
-  process.stdout.write(`打包完成：${tarball.filename}（${tarball.size} bytes${sha256 ? `，sha256=${sha256}` : ''}）\n`);
+          const state = { ...core, tarball: tarball.filename, tarball_bytes: tarball.size, tarball_sha256: sha256 };
+          writeFileSync(corePath, JSON.stringify(state, null, 2));
+          process.stdout.write(`打包完成：${tarball.filename}（${tarball.size} bytes${sha256 ? `，sha256=${sha256}` : ''}）\n`);
 
-  if (!core.dryRun) {
-    try {
-      await deliver(buildPayload({ phase: 'publishing', core: state }));
-    } catch (error) {
-      process.stderr.write(`发布前通知投递失败：${errorSummary(error)}\n`);
-      if (String(process.env.NOTIFY_REQUIRED || 'true').toLowerCase() !== 'false') process.exit(1);
-    }
-  }
-}
+          if (!core.dryRun) {
+            try {
+              await deliver(buildPayload({ phase: 'publishing', core: state }));
+            } catch (error) {
+              process.stderr.write(`发布前通知投递失败：${errorSummary(error)}\n`);
+              if (String(process.env.NOTIFY_REQUIRED || 'true').toLowerCase() !== 'false') process.exit(1);
+            }
+          }
+                  }
 
-if (IS_DIRECT) {
-  try {
-    await main();
-  } catch (error) {
-    process.stderr.write(`打包异常：${errorSummary(error)}\n`);
-    process.exit(1);
-  }
-}
-// <<< prepare
-PREPARE_JS
+                  if (IS_DIRECT) {
+          try {
+            await main();
+          } catch (error) {
+            process.stderr.write(`打包异常：${errorSummary(error)}\n`);
+            process.exit(1);
+          }
+                  }
+                  // <<< prepare
+          PREPARE_JS
           cd "$GITHUB_WORKSPACE${PKG_TARGET_DIR:+/$PKG_TARGET_DIR}"
           node "$stage/prepare.mjs"
 
@@ -466,178 +466,188 @@ PREPARE_JS
           set -euo pipefail
           stage="$RUNNER_TEMP/npm-publish"
           cat > "$stage/publish.mjs" <<'PUBLISH_JS'
-// >>> publish
-import { appendFileSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
-import { spawn } from 'node:child_process';
-import { buildPayload, deliver, errorSummary } from './notify-lib.mjs';
+                  // >>> publish
+                  import { appendFileSync, readFileSync } from 'node:fs';
+                  import { join } from 'node:path';
+                  import { spawn } from 'node:child_process';
+                  import { buildPayload, deliver, errorSummary } from './notify-lib.mjs';
+          import { parseNpmAuthOutput } from './verification-parse.mjs';
 
-export const IS_DIRECT = String(process.argv[1] || '').endsWith('publish.mjs');
+                  export const IS_DIRECT = String(process.argv[1] || '').endsWith('publish.mjs');
 
-// >>> verification-parse
-// npm prints the second-factor URL in the middle of a long notice block. Two
-// layouts exist: the modern `auth/cli/<uuid>` challenge (the URL can carry the
-// one-time code as a query parameter) and the older browser-login prompt where
-// the code is printed separately. The match stops at whitespace and obvious
-// punctuation (`"`, `'`, `<`, `>`, backtick, asterisk, brackets) so markdown or
-// JSON quoting around the link cannot leak into the forwarded URL.
-export const VERIFICATION_PATTERNS = [
-  { kind: 'npm-2fa', re: /https:\/\/www\.npmjs\.com\/auth\/cli\/[^\s'"<>()\[\]*`]+/g },
-  { kind: 'npm-2fa', re: /https:\/\/www\.npmjs\.com\/login\/[^\s'"<>()\[\]*`]+/g },
-  { kind: 'npm-2fa', re: /https:\/\/[^\s'"<>()\[\]*`]*\/auth\/cli\/[^\s'"<>()\[\]*`]*/g },
-  {
-    kind: 'npm-login-required',
-    re: /https:\/\/[^\s'"<>()\[\]*`]*npmjs\.(?:com|org)\/(?:login|auth|signup)[^\s'"<>()\[\]*`]*/g,
-  },
-];
 
-export function extractVerificationCode(text) {
-  const labelled = /one[\s-]?tim(?:e|\s)?\s*password\s*(?:is)?\s*[:：]?\s*([0-9]{6,8})\b/i.exec(text || '');
-  if (labelled) return labelled[1];
-  const afterPrompt = /(?:enter otp|otp)\s*[:：]\s*([0-9]{6,8})\b/i.exec(text || '');
-  if (afterPrompt) return afterPrompt[1];
-  const inQuery = /[?&]code=([0-9]{6,8})\b/.exec(text || '');
-  if (inQuery) return inQuery[1];
-  return '';
-}
+                  async function main() {
+          const temp = process.env.RUNNER_TEMP || '/tmp';
+          const core = JSON.parse(readFileSync(join(temp, 'release.json'), 'utf8'));
+          const pkg = JSON.parse(readFileSync('package.json', 'utf8'));
+          const state = { ...core, package: core.name || pkg.name };
+          const waitMinutes = Number(process.env.NPM_OTP_WAIT_MINUTES || 10);
+          const notified = { value: false };
+          const captured = [];
 
-export function parseNpmAuthOutput(text) {
-  const source = String(text || '');
-  const matches = [];
-  for (const pattern of VERIFICATION_PATTERNS) {
-    for (const match of source.matchAll(pattern.re)) {
-      if (!matches.includes(match[0])) matches.push(match[0]);
-    }
-  }
-  const url = matches.find((candidate) => candidate.includes('/auth/cli/')) || matches[0] || '';
-  // A login link is only a plain sign-in prompt when nothing in the output
-  // mentions a second factor. npm prints `EOTP`/`one-time password` both for the
-  // modern challenge URL and for the older browser-login prompt.
-  const mentionsSecondFactor =
-    url.includes('/auth/cli/') ||
-    url.includes('/login/') ||
-    url.includes('/auth/') ||
-    /\beotp\b|one[\s-]?time password|verification code/i.test(source);
-  return {
-    url,
-    code: extractVerificationCode(source),
-    kind: url ? (mentionsSecondFactor ? 'npm-2fa' : 'npm-login-required') : '',
-  };
-}
-// <<< verification-parse
+          const remember = (chunk) => {
+            captured.push(chunk);
+            while (captured.join('').length > 65_536 && captured.length > 1) captured.shift();
+          };
 
-async function main() {
-  const temp = process.env.RUNNER_TEMP || '/tmp';
-  const core = JSON.parse(readFileSync(join(temp, 'release.json'), 'utf8'));
-  const pkg = JSON.parse(readFileSync('package.json', 'utf8'));
-  const state = { ...core, package: core.name || pkg.name };
-  const waitMinutes = Number(process.env.NPM_OTP_WAIT_MINUTES || 10);
-  const notified = { value: false };
-  const captured = [];
+          const announceAuth = async (parsed, reason) => {
+            if (notified.value) {
+              process.stdout.write('本次运行已投递过验证提示，跳过重复通知\n');
+              return;
+            }
+            notified.value = true;
+            if (state.dryRun) {
+              process.stdout.write('dry-run：检测到二次验证提示，未投递 webhook\n');
+              return;
+            }
+            const payload = buildPayload({
+              phase: parsed.kind || 'npm-2fa',
+              core: state,
+              auth: { kind: parsed.kind || 'npm-2fa', url: parsed.url, code: parsed.code },
+              summary: `${reason}，请在 ${waitMinutes} 分钟内完成：${parsed.url || '见 workflow 日志中的原始输出'}`,
+            });
+            try {
+              await deliver(payload);
+              process.stdout.write(`已把验证网址转发到 webhook（title=${payload.title}）\n`);
+            } catch (error) {
+              process.stderr.write(`验证网址转发失败：${errorSummary(error)}\n`);
+            }
+          };
 
-  const remember = (chunk) => {
-    captured.push(chunk);
-    while (captured.join('').length > 65_536 && captured.length > 1) captured.shift();
-  };
+          const args = ['publish', '--access', 'public', '--tag', state.distTag];
+          if (process.env.INPUT_OTP) args.push('--otp', process.env.INPUT_OTP);
+          if (state.dryRun) args.push('--dry-run');
+          process.stdout.write(`运行：npm ${args.join(' ')}\n`);
 
-  const announceAuth = async (parsed, reason) => {
-    if (notified.value) {
-      process.stdout.write('本次运行已投递过验证提示，跳过重复通知\n');
-      return;
-    }
-    notified.value = true;
-    if (state.dryRun) {
-      process.stdout.write('dry-run：检测到二次验证提示，未投递 webhook\n');
-      return;
-    }
-    const payload = buildPayload({
-      phase: parsed.kind || 'npm-2fa',
-      core: state,
-      auth: { kind: parsed.kind || 'npm-2fa', url: parsed.url, code: parsed.code },
-      summary: `${reason}，请在 ${waitMinutes} 分钟内完成：${parsed.url || '见 workflow 日志中的原始输出'}`,
-    });
-    try {
-      await deliver(payload);
-      process.stdout.write(`已把验证网址转发到 webhook（title=${payload.title}）\n`);
-    } catch (error) {
-      process.stderr.write(`验证网址转发失败：${errorSummary(error)}\n`);
-    }
-  };
+          const child = spawn('npm', args, {
+            env: { ...process.env, npm_config_git_checks: 'false' },
+            stdio: ['ignore', 'pipe', 'pipe'],
+          });
 
-  const args = ['publish', '--access', 'public', '--tag', state.distTag];
-  if (process.env.INPUT_OTP) args.push('--otp', process.env.INPUT_OTP);
-  if (state.dryRun) args.push('--dry-run');
-  process.stdout.write(`运行：npm ${args.join(' ')}\n`);
+          let announced = false;
+          const handleChunk = (chunk) => {
+            remember(chunk);
+            const parsed = parseNpmAuthOutput(captured.join('').slice(-65_536));
+            if (parsed.url && !announced) {
+              announced = true;
+              void announceAuth(parsed, 'npm 要求二次验证或登录');
+            }
+          };
 
-  const child = spawn('npm', args, {
-    env: { ...process.env, npm_config_git_checks: 'false' },
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
+          for (const stream of ['stdout', 'stderr']) {
+            child[stream].setEncoding('utf8');
+            child[stream].on('data', (chunk) => {
+              process.stdout.write(chunk);
+              handleChunk(chunk);
+            });
+          }
 
-  let announced = false;
-  const handleChunk = (chunk) => {
-    remember(chunk);
-    const parsed = parseNpmAuthOutput(captured.join('').slice(-65_536));
-    if (parsed.url && !announced) {
-      announced = true;
-      void announceAuth(parsed, 'npm 要求二次验证或登录');
-    }
-  };
+          const exitCode = await new Promise((resolveCode) => {
+            child.on('error', (error) => {
+              process.stderr.write(`无法启动 npm：${error.message}\n`);
+              resolveCode(127);
+            });
+            child.on('close', (code) => resolveCode(code ?? 1));
+          });
 
-  for (const stream of ['stdout', 'stderr']) {
-    child[stream].setEncoding('utf8');
-    child[stream].on('data', (chunk) => {
-      process.stdout.write(chunk);
-      handleChunk(chunk);
-    });
-  }
+          if (exitCode !== 0) {
+            process.stderr.write(`npm publish 以退出码 ${exitCode} 结束\n`);
+            if (!state.dryRun) {
+              const tail = captured.join('').slice(-4096);
+              const parsedTail = parseNpmAuthOutput(tail);
+              try {
+                await deliver(
+                  buildPayload({
+                    phase: 'failed',
+                    core: state,
+                    reason: `npm publish 退出码 ${exitCode}`,
+                    auth: parsedTail.url ? parsedTail : undefined,
+                    outputTail: tail,
+                  }),
+                );
+              } catch (error) {
+                process.stderr.write(`失败通知投递失败：${errorSummary(error)}\n`);
+              }
+            }
+            process.exit(1);
+          }
 
-  const exitCode = await new Promise((resolveCode) => {
-    child.on('error', (error) => {
-      process.stderr.write(`无法启动 npm：${error.message}\n`);
-      resolveCode(127);
-    });
-    child.on('close', (code) => resolveCode(code ?? 1));
-  });
+          process.stdout.write(`npm publish 结束，退出码 0${state.dryRun ? '（dry-run，未写入 registry）' : ''}\n`);
+          if (process.env.GITHUB_OUTPUT) appendFileSync(process.env.GITHUB_OUTPUT, `published=${state.dryRun ? 'false' : 'true'}\n`);
+                  }
 
-  if (exitCode !== 0) {
-    process.stderr.write(`npm publish 以退出码 ${exitCode} 结束\n`);
-    if (!state.dryRun) {
-      const tail = captured.join('').slice(-4096);
-      const parsedTail = parseNpmAuthOutput(tail);
-      try {
-        await deliver(
-          buildPayload({
-            phase: 'failed',
-            core: state,
-            reason: `npm publish 退出码 ${exitCode}`,
-            auth: parsedTail.url ? parsedTail : undefined,
-            outputTail: tail,
-          }),
-        );
-      } catch (error) {
-        process.stderr.write(`失败通知投递失败：${errorSummary(error)}\n`);
-      }
-    }
-    process.exit(1);
-  }
-
-  process.stdout.write(`npm publish 结束，退出码 0${state.dryRun ? '（dry-run，未写入 registry）' : ''}\n`);
-  if (process.env.GITHUB_OUTPUT) appendFileSync(process.env.GITHUB_OUTPUT, `published=${state.dryRun ? 'false' : 'true'}\n`);
-}
-
-if (IS_DIRECT) {
-  try {
-    await main();
-  } catch (error) {
-    process.stderr.write(`发布异常：${errorSummary(error)}\n`);
-    process.exit(1);
-  }
-}
-// <<< publish
-PUBLISH_JS
+                  if (IS_DIRECT) {
+          try {
+            await main();
+          } catch (error) {
+            process.stderr.write(`发布异常：${errorSummary(error)}\n`);
+            process.exit(1);
+          }
+                  }
+                  // <<< publish
+          PUBLISH_JS
           cd "$GITHUB_WORKSPACE${PKG_TARGET_DIR:+/$PKG_TARGET_DIR}"
           node "$stage/publish.mjs"
+
+      - name: Extract npm verification URL
+        run: |
+          set -euo pipefail
+          stage="$RUNNER_TEMP/npm-publish"
+          cat > "$stage/verification-parse.mjs" <<'VERIFICATION_PARSE_JS'
+          // >>> verification-parse
+          // npm prints the second-factor URL in the middle of a long notice block. Two
+          // layouts exist: the modern `auth/cli/<uuid>` challenge (the URL can carry the
+          // one-time code as a query parameter) and the older browser-login prompt where
+          // the code is printed separately. The match stops at whitespace and obvious
+          // punctuation so markdown or JSON quoting around the link cannot leak into the
+          // forwarded URL.
+          export const VERIFICATION_PATTERNS = [
+            { kind: 'npm-2fa', re: /https:\/\/www\.npmjs\.com\/auth\/cli\/[^\s'"<>()\[\]*`]+/g },
+            { kind: 'npm-2fa', re: /https:\/\/www\.npmjs\.com\/login\/[^\s'"<>()\[\]*`]+/g },
+            { kind: 'npm-2fa', re: /https:\/\/[^\s'"<>()\[\]*`]*\/auth\/cli\/[^\s'"<>()\[\]*`]*/g },
+            {
+              kind: 'npm-login-required',
+              re: /https:\/\/[^\s'"<>()\[\]*`]*npmjs\.(?:com|org)\/(?:login|auth|signup)[^\s'"<>()\[\]*`]*/g,
+            },
+          ];
+
+          export function extractVerificationCode(text) {
+            const labelled = /one[\s-]?tim(?:e|\s)?\s*password\s*(?:is)?\s*[:：]?\s*([0-9]{6,8})\b/i.exec(text || '');
+            if (labelled) return labelled[1];
+            const afterPrompt = /(?:enter otp|otp)\s*[:：]\s*([0-9]{6,8})\b/i.exec(text || '');
+            if (afterPrompt) return afterPrompt[1];
+            const inQuery = /[?&]code=([0-9]{6,8})\b/.exec(text || '');
+            if (inQuery) return inQuery[1];
+            return '';
+          }
+
+          export function parseNpmAuthOutput(text) {
+            const source = String(text || '');
+            const matches = [];
+            for (const pattern of VERIFICATION_PATTERNS) {
+              for (const match of source.matchAll(pattern.re)) {
+                if (!matches.includes(match[0])) matches.push(match[0]);
+              }
+            }
+            const url = matches.find((candidate) => candidate.includes('/auth/cli/')) || matches[0] || '';
+            // A login link is only a plain sign-in prompt when nothing in the output
+            // mentions a second factor. npm prints `EOTP`/`one-time password` both for the
+            // modern challenge URL and for the older browser-login prompt.
+            const mentionsSecondFactor =
+              url.includes('/auth/cli/') ||
+              url.includes('/login/') ||
+              url.includes('/auth/') ||
+              /\beotp\b|one[\s-]?time password|verification code/i.test(source);
+            return {
+              url,
+              code: extractVerificationCode(source),
+              kind: url ? (mentionsSecondFactor ? 'npm-2fa' : 'npm-login-required') : '',
+            };
+          }
+          // <<< verification-parse
+          VERIFICATION_PARSE_JS
+          node --check "$stage/verification-parse.mjs"
+          echo "二次验证网址提取器已就绪"
 
       - name: Create Forgejo release
         if: env.FORGEJO_TOKEN != ''
@@ -645,89 +655,89 @@ PUBLISH_JS
           set -euo pipefail
           stage="$RUNNER_TEMP/npm-publish"
           cat > "$stage/release.mjs" <<'RELEASE_JS'
-// >>> release
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
-import { spawnSync } from 'node:child_process';
-import { buildPayload, deliver, errorSummary } from './notify-lib.mjs';
+                  // >>> release
+                  import { readFileSync } from 'node:fs';
+                  import { join } from 'node:path';
+                  import { spawnSync } from 'node:child_process';
+                  import { buildPayload, deliver, errorSummary } from './notify-lib.mjs';
 
-export const IS_DIRECT = String(process.argv[1] || '').endsWith('release.mjs');
+                  export const IS_DIRECT = String(process.argv[1] || '').endsWith('release.mjs');
 
-export function buildReleaseBody(core, changelog) {
-  return [
-    `## ${core.package}@${core.version}`,
-    '',
-    `- dist-tag：\`${core.distTag}\``,
-    `- npm：https://www.npmjs.com/package/${core.package}/v/${core.version}`,
-    core.tarball ? `- tarball：\`${core.tarball}\`` : '',
-    core.tarball_sha256 ? `- sha256：\`${core.tarball_sha256}\`` : '',
-    '',
-    '### Commits',
-    '```',
-    changelog,
-    '```',
-    '',
-  ]
-    .filter((line) => line !== '')
-    .join('\n');
-}
+                  export function buildReleaseBody(core, changelog) {
+          return [
+            `## ${core.package}@${core.version}`,
+            '',
+            `- dist-tag：\`${core.distTag}\``,
+            `- npm：https://www.npmjs.com/package/${core.package}/v/${core.version}`,
+            core.tarball ? `- tarball：\`${core.tarball}\`` : '',
+            core.tarball_sha256 ? `- sha256：\`${core.tarball_sha256}\`` : '',
+            '',
+            '### Commits',
+            '```',
+            changelog,
+            '```',
+            '',
+          ]
+            .filter((line) => line !== '')
+            .join('\n');
+                  }
 
-export function gitText(args, run = spawnSync) {
-  const result = run('git', args, { encoding: 'utf8' });
-  return result.status === 0 ? result.stdout.trim() : '';
-}
+                  export function gitText(args, run = spawnSync) {
+          const result = run('git', args, { encoding: 'utf8' });
+          return result.status === 0 ? result.stdout.trim() : '';
+                  }
 
-async function main() {
-  const temp = process.env.RUNNER_TEMP || '/tmp';
-  const core = JSON.parse(readFileSync(join(temp, 'release.json'), 'utf8'));
-  const state = { ...core, package: core.name || '' };
-  const apiUrl = (state.apiUrl || `${state.serverUrl}/api/v1`).replace(/\/$/, '');
+                  async function main() {
+          const temp = process.env.RUNNER_TEMP || '/tmp';
+          const core = JSON.parse(readFileSync(join(temp, 'release.json'), 'utf8'));
+          const state = { ...core, package: core.name || '' };
+          const apiUrl = (state.apiUrl || `${state.serverUrl}/api/v1`).replace(/\/$/, '');
 
-  const previous = gitText(['describe', '--tags', '--abbrev=0', `${state.tag}^`]);
-  const changelog = gitText(['log', '--oneline', previous ? `${previous}..HEAD` : 'HEAD']) || '(没有可列出的提交)';
+          const previous = gitText(['describe', '--tags', '--abbrev=0', `${state.tag}^`]);
+          const changelog = gitText(['log', '--oneline', previous ? `${previous}..HEAD` : 'HEAD']) || '(没有可列出的提交)';
 
-  const response = await fetch(`${apiUrl}/repos/${state.repo}/releases`, {
-    method: 'POST',
-    headers: { authorization: `token ${process.env.FORGEJO_TOKEN}`, 'content-type': 'application/json' },
-    body: JSON.stringify({
-      tag_name: state.tag,
-      name: `${state.package} ${state.version}`,
-      body: buildReleaseBody(state, changelog),
-      draft: false,
-      prerelease: Boolean(state.prerelease),
-    }),
-  });
+          const response = await fetch(`${apiUrl}/repos/${state.repo}/releases`, {
+            method: 'POST',
+            headers: { authorization: `token ${process.env.FORGEJO_TOKEN}`, 'content-type': 'application/json' },
+            body: JSON.stringify({
+              tag_name: state.tag,
+              name: `${state.package} ${state.version}`,
+              body: buildReleaseBody(state, changelog),
+              draft: false,
+              prerelease: Boolean(state.prerelease),
+            }),
+          });
 
-  if (response.status === 200 || response.status === 201) {
-    const created = await response.json().catch(() => ({}));
-    process.stdout.write(`已创建 Forgejo Release：${created.html_url || state.tag}\n`);
-  } else if (response.status === 409) {
-    process.stdout.write(`Release ${state.tag} 已存在，跳过创建\n`);
-  } else {
-    process.stderr.write(`创建 Release 失败：HTTP ${response.status} ${await response.text()}\n`);
-    process.exit(1);
-  }
+          if (response.status === 200 || response.status === 201) {
+            const created = await response.json().catch(() => ({}));
+            process.stdout.write(`已创建 Forgejo Release：${created.html_url || state.tag}\n`);
+          } else if (response.status === 409) {
+            process.stdout.write(`Release ${state.tag} 已存在，跳过创建\n`);
+          } else {
+            process.stderr.write(`创建 Release 失败：HTTP ${response.status} ${await response.text()}\n`);
+            process.exit(1);
+          }
 
-  if (!state.dryRun) {
-    try {
-      await deliver(buildPayload({ phase: 'published', core: state }));
-    } catch (error) {
-      process.stderr.write(`完成通知投递失败：${errorSummary(error)}\n`);
-      if (String(process.env.NOTIFY_REQUIRED || 'true').toLowerCase() !== 'false') process.exit(1);
-    }
-  }
-}
+          if (!state.dryRun) {
+            try {
+              await deliver(buildPayload({ phase: 'published', core: state }));
+            } catch (error) {
+              process.stderr.write(`完成通知投递失败：${errorSummary(error)}\n`);
+              if (String(process.env.NOTIFY_REQUIRED || 'true').toLowerCase() !== 'false') process.exit(1);
+            }
+          }
+                  }
 
-if (IS_DIRECT) {
-  try {
-    await main();
-  } catch (error) {
-    process.stderr.write(`创建 Release 异常：${errorSummary(error)}\n`);
-    process.exit(1);
-  }
-}
-// <<< release
-RELEASE_JS
+                  if (IS_DIRECT) {
+          try {
+            await main();
+          } catch (error) {
+            process.stderr.write(`创建 Release 异常：${errorSummary(error)}\n`);
+            process.exit(1);
+          }
+                  }
+                  // <<< release
+          RELEASE_JS
           cd "$GITHUB_WORKSPACE${PKG_TARGET_DIR:+/$PKG_TARGET_DIR}"
           node "$stage/release.mjs"
 
@@ -738,19 +748,19 @@ RELEASE_JS
           stage="$RUNNER_TEMP/npm-publish"
           mkdir -p "$stage"
           cat > "$stage/notify-failure.mjs" <<'NOTIFY_FAILURE_JS'
-import { existsSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
-import { buildPayload, deliver, errorSummary } from './notify-lib.mjs';
+          import { existsSync, readFileSync } from 'node:fs';
+          import { join } from 'node:path';
+          import { buildPayload, deliver, errorSummary } from './notify-lib.mjs';
 
-const temp = process.env.RUNNER_TEMP || '/tmp';
-const corePath = join(temp, 'release.json');
-const core = existsSync(corePath) ? JSON.parse(readFileSync(corePath, 'utf8')) : {};
-const payload = buildPayload({ phase: 'failed', core, reason: '工作流在发布完成前失败，请查看 run 日志' });
-try {
-  await deliver(payload);
-  process.stdout.write(`已投递失败通知（title=${payload.title}, url=${payload.url}）\n`);
-} catch (error) {
-  process.stderr.write(`失败通知投递失败：${errorSummary(error)}\n`);
-}
-NOTIFY_FAILURE_JS
+          const temp = process.env.RUNNER_TEMP || '/tmp';
+          const corePath = join(temp, 'release.json');
+          const core = existsSync(corePath) ? JSON.parse(readFileSync(corePath, 'utf8')) : {};
+          const payload = buildPayload({ phase: 'failed', core, reason: '工作流在发布完成前失败，请查看 run 日志' });
+          try {
+            await deliver(payload);
+            process.stdout.write(`已投递失败通知（title=${payload.title}, url=${payload.url}）\n`);
+          } catch (error) {
+            process.stderr.write(`失败通知投递失败：${errorSummary(error)}\n`);
+          }
+          NOTIFY_FAILURE_JS
           node "$stage/notify-failure.mjs"
