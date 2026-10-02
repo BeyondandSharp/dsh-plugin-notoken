@@ -75,15 +75,19 @@ export function extractAuthFlow(text, { parseJson = parseLastJsonObject } = {}) 
   let doneUrl = firstUrl(error.doneUrl, error.done);
   let loginUrl = firstUrl(error.loginUrl);
 
-  // Prose fallback: `npm login` prints "Login at: <url>", and a 401 prints
-  // "Log in on <registry>". The generic scan covers registry-specific paths.
+  // Prose fallback. NOTE: npm prints "Log in on https://registry.npmjs.org/"
+  // immediately before the real link, and that registry origin is useless to the
+  // reader — so only URLs that look like an authorisation endpoint are accepted,
+  // and the most specific one wins.
+  if (!authUrl) authUrl = findAuthUrl(source);
   if (!authUrl) {
+    // Last resort: the text after "Login at:" / "Log in on", but never a bare
+    // registry origin.
     const match = /(?:log\s*in\s+(?:at|on)|open\s+(?:this\s+)?(?:url|link)[^\n]*?)\s*:?\s*(https?:\/\/\S+)/i.exec(source);
-    if (match) authUrl = match[1].replace(/[),.;'"\]]+$/, '');
-  }
-  if (!authUrl) {
-    const match = /https?:\/\/\S*\/(?:auth\/cli|login|signin|web-login)[^\s'"<>()[\]]*/.exec(source);
-    if (match) authUrl = match[0];
+    if (match) {
+      const candidate = match[1].replace(/[),.;'"\]]+$/, '');
+      if (!/^https?:\/\/[^/]+\/?$/.test(candidate)) authUrl = candidate;
+    }
   }
   if (!doneUrl) {
     const match = /https?:\/\/\S*\/(?:auth\/done|-\/v1\/done)[^\s'"<>()[\]]*/.exec(source);
@@ -94,6 +98,56 @@ export function extractAuthFlow(text, { parseJson = parseLastJsonObject } = {}) 
   const token = typeof parsed.token === 'string' ? parsed.token : '';
   const code = typeof error.code === 'string' ? error.code : '';
   return { authUrl, doneUrl, loginUrl, token, code, raw: parsed };
+}
+
+/**
+ * The most specific authorisation URL printed in `text`.
+ *
+ * Ranked so that npm's own one-time link beats a generic login page, and a bare
+ * registry origin is never returned: `npm notice Log in on
+ * https://registry.npmjs.org/` must not shadow the `Login at:` URL that follows.
+ */
+export function findAuthUrl(text) {
+  const source = String(text || '');
+  const patterns = [
+    // npm's one-time verification links, and the hosted page carrying the same
+    // session (https://www.npmjs.com/login?next=/login/cli/<uuid>). A generic
+    // login page is not accepted: only session-carrying links lead anywhere.
+    /(https?:\/\/\S+\/(?:auth|login)\/cli\/[^\s'"]*)/g,
+    /(https?:\/\/\S+\/[^\s'"?]*\?[^\s'"]*next=[^&#\s]*\/login\/cli\/[^\s'"]*)/g,
+  ];
+  for (const pattern of patterns) {
+    const found = [...source.matchAll(pattern)]
+      .map((match) => match[1].replace(/[),.;'"]+$/, ''))
+      .filter(Boolean);
+    if (found.length > 0) return found[found.length - 1];
+  }
+  return '';
+}
+
+/**
+ * Like {@link findAuthUrl}, but only returns a URL that is known to be complete.
+ *
+ * Output arrives in chunks, so a URL can be split at any point. A candidate is
+ * considered final only when it is followed by whitespace/a quote (or the buffer
+ * fell exactly on a line end), which means the reader will not be handed a
+ * truncated link that then cannot be corrected — `announce` dedupes by URL.
+ */
+export function findCompleteAuthUrl(text) {
+  const source = String(text || '');
+  const patterns = [
+    /(https?:\/\/\S+\/(?:auth|login)\/cli\/[^\s'"]*)([\s'"]|$)/g,
+    /(https?:\/\/\S+\/[^\s'"?]*\?[^\s'"]*next=[^&#\s]*\/login\/cli\/[^\s'"]*)([\s'"]|$)/g,
+  ];
+  for (const pattern of patterns) {
+    const found = [...source.matchAll(pattern)]
+      // A trailing line break is conclusive; a bare buffer end is not.
+      .filter((match) => match[2] !== '' || text.endsWith('\n') || text.endsWith('\r'))
+      .map((match) => match[1].replace(/[),.;'"]+$/, ''))
+      .filter(Boolean);
+    if (found.length > 0) return found[found.length - 1];
+  }
+  return '';
 }
 
 /** npm fell back to an interactive username prompt: web login is not available. */

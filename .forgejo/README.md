@@ -238,8 +238,13 @@ dist-tag 默认：正式版 `latest`，含 `-` 的预发布版 `next`；可用�
 
 | 场景 | 脚本从哪里拿到网址 | 拿到之后 |
 | --- | --- | --- |
-| 未登录 | `npm login --auth-type=web` 直接打印 `Log in on <url>` | 转发；npm 自己轮询，脚本同时可轮询 `doneUrl` |
+| 未登录 | `npm login --auth-type=web` 打印 `Login at:` + 链接 | **边打印边转发**（见下）；npm 自己轮询，脚本也可轮询 `doneUrl` |
 | 需要二次验证 | `npm publish --json` 失败，错误 JSON 里的 `error.authUrl` / `error.doneUrl` | 转发 `authUrl`，轮询 `doneUrl`（202 继续等 / 200 返回 `{token}`），再用 `--otp=<token>` 重试 |
+
+两个必须注意的实现点：
+
+1. **登录链接必须边读边发**。`npm login` 打印链接后**不会退出**，它要一直轮询到你完成登录。如果等命令结束再取输出，就会死锁：你收不到链接 → 无法登录 → 命令不结束。脚本因此在输出流里一发现完整链接就立刻转发。
+2. **npm 会先打印 registry 首页**：`npm notice Log in on https://registry.npmjs.org/` 紧跟真正的 `Login at:` 链接。脚本只认带会话的一次性链接（`/auth/cli/<uuid>` 或 `/login?next=/login/cli/<uuid>`），registry 首页、`/-/web-login`、普通 `/signin` 这类"点了也没用"的页面一律不发送。分块到达时，只有确认链接已完整（后面跟到分隔符）才发送，避免发出被截断的地址。
 
 解析要点：npm 的报错 JSON 每一行都带 `npm error ` 前缀，脚本会先剥掉前缀再按 `{`…`}` 解析。
 

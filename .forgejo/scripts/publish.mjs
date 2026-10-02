@@ -7,6 +7,8 @@ import { parseNpmAuthOutput } from './verification-parse.mjs';
 import {
   extractAuthFlow,
   fellBackToPasswordPrompt,
+  findAuthUrl,
+  findCompleteAuthUrl,
   needsPty,
   parseLastJsonObject,
   pollDoneUrl,
@@ -113,8 +115,15 @@ async function main() {
     }
   };
 
-  /** Run npm, stream its output, and keep the tail for parsing. */
-  const runNpm = (args, { timeoutMs = waitMs } = {}) =>
+  /**
+   * Run npm, stream its output, and keep the tail for parsing.
+   *
+   * `onAuthUrl` fires as soon as an authorisation link appears in the stream:
+   * `npm login` prints the link and then blocks while it polls, so waiting for
+   * the process to exit before relaying would deadlock — the human cannot log in
+   * without the link we have not sent yet.
+   */
+  const runNpm = (args, { timeoutMs = waitMs, onAuthUrl, phase = 'npm-2fa' } = {}) =>
     new Promise((resolveRun) => {
       const command = usePty ? npmCommand(args, { usePty, timeoutSeconds: Math.round(waitMs / 1000) }) : 'npm';
       const useShell = usePty;
@@ -130,6 +139,7 @@ async function main() {
           });
 
       let captured = '';
+      let announcedUrl = '';
       const timer = setTimeout(() => {
         process.stderr.write(`npm 运行超过 ${Math.round(timeoutMs / 1000)}s，终止\n`);
         try {
@@ -141,6 +151,15 @@ async function main() {
       const handle = (chunk) => {
         process.stdout.write(chunk);
         captured = `${captured}${chunk}`.slice(-262_144);
+        if (!onAuthUrl) return;
+        // Only a URL that is known to be whole (a chunk boundary can split it).
+        const url = findCompleteAuthUrl(captured);
+        if (url && url !== announcedUrl) {
+          announcedUrl = url;
+          Promise.resolve(onAuthUrl(url, phase)).catch((error) => {
+            process.stderr.write(`网址转发失败：${errorSummary(error)}\n`);
+          });
+        }
       };
       child.stdout.setEncoding('utf8');
       child.stderr.setEncoding('utf8');
@@ -153,7 +172,18 @@ async function main() {
       });
       child.on('close', (code) => {
         clearTimeout(timer);
-        resolveRun({ code: code ?? 1, captured: cleanOutput(captured) });
+        const finalText = cleanOutput(captured);
+        if (onAuthUrl) {
+          // The stream is over, so any URL left in the buffer is complete.
+          const url = findAuthUrl(finalText);
+          if (url && url !== announcedUrl) {
+            announcedUrl = url;
+            Promise.resolve(onAuthUrl(url, phase)).catch((error) => {
+              process.stderr.write(`网址转发失败：${errorSummary(error)}\n`);
+            });
+          }
+        }
+        resolveRun({ code: code ?? 1, captured: finalText });
       });
     });
 
@@ -165,7 +195,14 @@ async function main() {
   // --- 1. login, if needed. ------------------------------------------------
   if (!state.dryRun && !isAuthenticated()) {
     process.stdout.write('npm 未登录：发起网页登录\n');
-    const login = await runNpm(['login', '--auth-type=web'], { timeoutMs: waitMs });
+    // npm prints the login link and then polls; relay it from the stream so the
+    // human can actually act, instead of waiting for an exit that only happens
+    // after they have already logged in.
+    const login = await runNpm(['login', '--auth-type=web'], {
+      timeoutMs: waitMs,
+      phase: 'npm-login-required',
+      onAuthUrl: (url) => announce(url, 'npm-login-required'),
+    });
     const flow = extractAuthFlow(login.captured || '');
     const prose = parseNpmAuthOutput(login.captured || '');
 

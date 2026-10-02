@@ -158,9 +158,18 @@ export const AUTH_PHASES = new Set(['npm-login-required', 'npm-2fa', 'npm-login'
  * so a bare registry origin (https://registry.npmjs.org) and a repository page
  * (https://git.example.com/owner/repo/actions/runs/11) do not qualify.
  */
+/**
+ * Is this a link the reader can actually finish a login or a second factor with?
+ *
+ * Only npm's one-time session links qualify: `/auth/cli/<uuid>`, or the hosted
+ * page that carries the same session (`/login?next=/login/cli/<uuid>`). A generic
+ * `/-/web-login` page or a bare login/signin route is deliberately rejected — the
+ * Action promises never to hand the reader a page that leads nowhere.
+ */
 export function isAuthUrl(value) {
   if (!isHttpUrl(value)) return false;
-  return /\/(?:auth|login|signin|sign-in|weblogin|web-login|oauth)\b/i.test(value);
+  if (/\/(?:auth|login)\/cli\/[^/?#\s]+/i.test(value)) return true;
+  return /[?&]next=[^&#\s]*\/login\/cli\//i.test(value);
 }
 
 /**
