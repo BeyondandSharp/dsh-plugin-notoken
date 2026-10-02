@@ -161,6 +161,75 @@ jobs:
           cp "$dir/scripts/notify-lib.mjs" "$stage/notify-lib.mjs"
           echo "已暂存 $dir/scripts/notify-lib.mjs → $stage/notify-lib.mjs"
 
+      - name: Extract npm verification URL
+        run: |
+          set -euo pipefail
+          stage="$RUNNER_TEMP/npm-publish"
+          cat > "$stage/verification-parse.mjs" <<'VERIFICATION_PARSE_JS'
+          // >>> verification-parse
+          // npm prints the second-factor URL in the middle of a long notice block. Two
+          // layouts exist: the modern `auth/cli/<uuid>` challenge (the URL can carry the
+          // one-time code as a query parameter) and the older browser-login prompt where
+          // the code is printed separately. The match stops at whitespace and obvious
+          // punctuation so markdown or JSON quoting around the link cannot leak into the
+          // forwarded URL.
+          export const VERIFICATION_PATTERNS = [
+            { kind: 'npm-2fa', re: /https:\/\/www\.npmjs\.com\/auth\/cli\/[^\s'"<>()\[\]*`]+/g },
+            { kind: 'npm-2fa', re: /https:\/\/www\.npmjs\.com\/login\/[^\s'"<>()\[\]*`]+/g },
+            { kind: 'npm-2fa', re: /https:\/\/[^\s'"<>()\[\]*`]*\/auth\/cli\/[^\s'"<>()\[\]*`]*/g },
+            {
+              kind: 'npm-login-required',
+              re: /https:\/\/[^\s'"<>()\[\]*`]*npmjs\.(?:com|org)\/(?:login|auth|signup)[^\s'"<>()\[\]*`]*/g,
+            },
+            // Unauthenticated publish: npm prints a `Log in on <registry>` notice plus
+            // a link, and the 401 body can carry an `authUrl` field.
+            {
+              kind: 'npm-login-required',
+              re: /"authUrl"\s*:\s*"(https:[^"]+)"/g,
+            },
+            {
+              kind: 'npm-login-required',
+              re: /https:\/\/[^\s'"<>()\[\]*`]+\/(?:login|signin|auth)[^\s'"<>()\[\]*`]*/g,
+            },
+          ];
+
+          export function extractVerificationCode(text) {
+            const labelled = /one[\s-]?tim(?:e|\s)?\s*password\s*(?:is)?\s*[:：]?\s*([0-9]{6,8})\b/i.exec(text || '');
+            if (labelled) return labelled[1];
+            const afterPrompt = /(?:enter otp|otp)\s*[:：]\s*([0-9]{6,8})\b/i.exec(text || '');
+            if (afterPrompt) return afterPrompt[1];
+            const inQuery = /[?&]code=([0-9]{6,8})\b/.exec(text || '');
+            if (inQuery) return inQuery[1];
+            return '';
+          }
+
+          export function parseNpmAuthOutput(text) {
+            const source = String(text || '');
+            const matches = [];
+            for (const pattern of VERIFICATION_PATTERNS) {
+              for (const match of source.matchAll(pattern.re)) {
+                if (!matches.includes(match[0])) matches.push(match[0]);
+              }
+            }
+            const url = matches.find((candidate) => candidate.includes('/auth/cli/')) || matches[0] || '';
+            // A login link is only a plain sign-in prompt when nothing in the output
+            // mentions a second factor. npm prints `EOTP`/`one-time password` both for the
+            // modern challenge URL and for the older browser-login prompt.
+            const mentionsSecondFactor =
+              url.includes('/auth/cli/') ||
+              url.includes('/login/') ||
+              url.includes('/auth/') ||
+              /\beotp\b|one[\s-]?time password|verification code/i.test(source);
+            return {
+              url,
+              code: extractVerificationCode(source),
+              kind: url ? (mentionsSecondFactor ? 'npm-2fa' : 'npm-login-required') : '',
+            };
+          }
+          // <<< verification-parse
+          VERIFICATION_PARSE_JS
+          node --check "$stage/verification-parse.mjs"
+
       - name: Install dependencies
         run: |
           set -euo pipefail
@@ -709,75 +778,6 @@ jobs:
           PUBLISH_JS
           cd "$GITHUB_WORKSPACE${PKG_TARGET_DIR:+/$PKG_TARGET_DIR}"
           node "$stage/publish.mjs"
-
-      - name: Extract npm verification URL
-        run: |
-          set -euo pipefail
-          stage="$RUNNER_TEMP/npm-publish"
-          cat > "$stage/verification-parse.mjs" <<'VERIFICATION_PARSE_JS'
-          // >>> verification-parse
-          // npm prints the second-factor URL in the middle of a long notice block. Two
-          // layouts exist: the modern `auth/cli/<uuid>` challenge (the URL can carry the
-          // one-time code as a query parameter) and the older browser-login prompt where
-          // the code is printed separately. The match stops at whitespace and obvious
-          // punctuation so markdown or JSON quoting around the link cannot leak into the
-          // forwarded URL.
-          export const VERIFICATION_PATTERNS = [
-            { kind: 'npm-2fa', re: /https:\/\/www\.npmjs\.com\/auth\/cli\/[^\s'"<>()\[\]*`]+/g },
-            { kind: 'npm-2fa', re: /https:\/\/www\.npmjs\.com\/login\/[^\s'"<>()\[\]*`]+/g },
-            { kind: 'npm-2fa', re: /https:\/\/[^\s'"<>()\[\]*`]*\/auth\/cli\/[^\s'"<>()\[\]*`]*/g },
-            {
-              kind: 'npm-login-required',
-              re: /https:\/\/[^\s'"<>()\[\]*`]*npmjs\.(?:com|org)\/(?:login|auth|signup)[^\s'"<>()\[\]*`]*/g,
-            },
-            // Unauthenticated publish: npm prints a `Log in on <registry>` notice plus
-            // a link, and the 401 body can carry an `authUrl` field.
-            {
-              kind: 'npm-login-required',
-              re: /"authUrl"\s*:\s*"(https:[^"]+)"/g,
-            },
-            {
-              kind: 'npm-login-required',
-              re: /https:\/\/[^\s'"<>()\[\]*`]+\/(?:login|signin|auth)[^\s'"<>()\[\]*`]*/g,
-            },
-          ];
-
-          export function extractVerificationCode(text) {
-            const labelled = /one[\s-]?tim(?:e|\s)?\s*password\s*(?:is)?\s*[:：]?\s*([0-9]{6,8})\b/i.exec(text || '');
-            if (labelled) return labelled[1];
-            const afterPrompt = /(?:enter otp|otp)\s*[:：]\s*([0-9]{6,8})\b/i.exec(text || '');
-            if (afterPrompt) return afterPrompt[1];
-            const inQuery = /[?&]code=([0-9]{6,8})\b/.exec(text || '');
-            if (inQuery) return inQuery[1];
-            return '';
-          }
-
-          export function parseNpmAuthOutput(text) {
-            const source = String(text || '');
-            const matches = [];
-            for (const pattern of VERIFICATION_PATTERNS) {
-              for (const match of source.matchAll(pattern.re)) {
-                if (!matches.includes(match[0])) matches.push(match[0]);
-              }
-            }
-            const url = matches.find((candidate) => candidate.includes('/auth/cli/')) || matches[0] || '';
-            // A login link is only a plain sign-in prompt when nothing in the output
-            // mentions a second factor. npm prints `EOTP`/`one-time password` both for the
-            // modern challenge URL and for the older browser-login prompt.
-            const mentionsSecondFactor =
-              url.includes('/auth/cli/') ||
-              url.includes('/login/') ||
-              url.includes('/auth/') ||
-              /\beotp\b|one[\s-]?time password|verification code/i.test(source);
-            return {
-              url,
-              code: extractVerificationCode(source),
-              kind: url ? (mentionsSecondFactor ? 'npm-2fa' : 'npm-login-required') : '',
-            };
-          }
-          // <<< verification-parse
-          VERIFICATION_PARSE_JS
-          node --check "$stage/verification-parse.mjs"
 
       - name: Create Forgejo release
         if: env.FORGEJO_TOKEN != ''
