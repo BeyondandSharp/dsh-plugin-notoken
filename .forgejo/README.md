@@ -10,10 +10,10 @@ push tag v1.4.0
       ├─ 测试、构建、npm pack + sha256      Test / Build / prepare
       ├─ npm whoami → 未登录则发起 npm login --auth-type=web
       │     └─ npm 打印 https://www.npmjs.com/auth/cli/<uuid> → 原样推给你
+      │     └─ npm 进程持续轮询，等你浏览器点完授权后自己结束
       ├─ npm publish（--access public --tag <dist-tag>）        publish
-      │     ├─ 需要登录/二次验证 → 把 npm 打印的网址 POST 到 webhook
-      │     ├─ 等待用户在浏览器完成（默认 15 分钟窗口）
-      │     └─ 自动重试发布（网址里带验证码时直接用码重试）
+      │     ├─ 需要二次验证 → npm 再返回一个 auth/cli/<uuid> 网址 → 再推给你
+      │     └─ 你在浏览器确认后 npm 自己完成提交
       ├─ 创建 Forgejo Release（changelog）   release
       └─ 任一步失败 → 推送 failed 通知（url 回退为 run 页面）
 ```
@@ -75,11 +75,8 @@ dist-tag 默认：正式版 `latest`，含 `-` 的预发布版 `next`；可用�
 | `SKIP_TEST` | 空 | `true` 跳过 `npm test` |
 | `SKIP_BUILD` | 空 | `true` 跳过 `npm run build`（无 build 脚本时自动跳过） |
 | `RELEASE_DIST_TAG` | 空 | 固定 dist-tag |
-| `NPM_REGISTRY` | 空 | 指定认证用的 registry。默认取 `npm config get registry`；内网镜像请用这个或 `.npmrc` |
-| `NPM_LOGIN_URL` | 空 | 覆盖"先导登录提示"的网址；最终仍以 npm 自己打印的地址为准 |
-| `NPM_LOGIN_POLL_MINUTES` | `5` | 发起网页登录后，轮询 `npm whoami` 等待你完成的天花板 |
-| `NPM_MAX_ATTEMPTS` | `6` | `npm publish` 的最大尝试次数（供测试压缩） |
-| `NPM_AUTH_WAIT_MINUTES` | `15` | 等待人工完成登录/二次验证的总时长；超时后发布失败并推送 `failed` |
+| `NPM_AUTH_WAIT_MINUTES` | `15` | 每次等待人工授权的上限（`npm login` 与 `npm publish` 各自计时）；超时后推送 `failed` |
+| `NPM_LOGIN_POLL_MINUTES` | `5` | 登录进程退出后仍继续探测 `npm whoami` 的额外窗口 |
 | `NPM_AUTH_RETRY_DELAY_SECONDS` | 空 | 每次重试之间的等待秒数（默认 30s；从网址拿到验证码时 5s）。主要给测试用 |
 
 ## webhook 载荷契约（v1）
@@ -120,13 +117,16 @@ dist-tag 默认：正式版 `latest`，含 `-` 的预发布版 `next`；可用�
 
 `phase` 取值：`publishing`、`npm-2fa`、`npm-login-required`、`published`、`failed`。（版本已存在时按幂等成功静默退出，不推送，避免重复推 tag 刷屏。）
 
-`url` **就是 npm 自己给出的地址**，优先级为：
+`url` **永远是 npm 进程自己打印的那一条**，不做任何拼接或兜底：
 
-1. `npm login --auth-type=web` 打印的 `https://www.npmjs.com/auth/cli/<uuid>`（你要的那种一次性授权链接；工作流会在 runner 里真正发起网页登录，无 TTY 时用 `script(1)` 提供伪终端）；
-2. `npm publish` 的 401 响应里的 `authUrl` / `Log in on <registry>` 语句（内网 registry 就给内网地址）；
-3. 兜底的 registry web-login 地址（由 `npm config get registry` 或 `NPM_REGISTRY` 拼出，可用 `NPM_LOGIN_URL` 覆盖）。
+| 阶段 | `phase` | 来源 |
+| --- | --- | --- |
+| 需要登录 | `npm-login-required` | `npm login --auth-type=web` 打印的 `auth/cli/<uuid>` |
+| 需要二次验证 | `npm-2fa` | `npm publish` 打印的第二个 `auth/cli/<uuid>` |
 
-**不同地址都会推送**（先导提示 + npm 的一次性链接是两条不同的地址，都会发给你）；**完全相同的地址只推一次**，不会重复打扰。
+关键点：**每次 npm 调用都在伪终端（`script(1)`）里运行**。没有 TTY 时 npm 根本不会进入网页验证流程，只会打印 `E401` —— 这也是之前拿不到 `auth/cli` 网址的原因。转发后 npm 进程原地轮询，你在浏览器点完授权它就自己继续，不需要你回传任何东西。
+
+**不同网址都会推送**（登录一条、二次验证一条）；**完全相同的网址只推一次**。
 
 ### 接收端配置（message-pusher 自定义 Webhook）
 
