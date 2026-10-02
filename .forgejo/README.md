@@ -28,20 +28,79 @@ push tag v1.4.0
 cp -r npm-publish /path/to/target-repo/.forgejo
 ```
 
-复制后的目录结构（**请整目录复制，`scripts/notify-lib.mjs` 是必需的**）：
+复制后的目录结构（**必须整目录复制**：workflow 只是编排，逻辑都在脚本里）：
 
 ```
 .forgejo/
-├── workflows/npm-publish.yml     # 全部流程与内联的 Node 程序
-└── scripts/notify-lib.mjs        # webhook 载荷与投递逻辑（被上面内联程序 import）
+├── workflows/
+│   └── npm-publish.yml            # 165 行，只有编排；唯一的 shell 是定位入口那 3 行
+└── scripts/                       # 全部逻辑，普通 .mjs 文件
+    ├── run.mjs                    # 分发器：每个步骤一行调用它
+    ├── locate-action.mjs          # 找 Action 目录（github.action_path 为空的情况）
+    ├── notify-lib.mjs             # webhook 载荷、投递、认证链接判定
+    ├── verification-parse.mjs     # 从 npm 输出里提取授权链接与验证码
+    ├── resolve.mjs                # tag → 版本/dist-tag/运行信息
+    ├── preflight.mjs              # 预检：private/产物/tag 未移动/registry 比对
+    ├── prepare.mjs                # 对齐版本 + npm pack + sha256
+    ├── publish.mjs                # 网页登录 → 二次验证 → 发布
+    ├── release.mjs                # 建 Forgejo Release
+    └── notify-failure.mjs         # 失败收尾
 ```
+
+workflow 里每一步都长这样（`配置里没有内嵌脚本`）：
+
+```yaml
+      - name: Publish to npm
+        run: |
+          dir="${{ steps.locate.outputs.forgejo_dir }}"
+          node "$dir/scripts/run.mjs" publish
+```
+
+唯一的例外是定位步骤本身 —— 它必须先找到 `run.mjs` 才能调用它，所以有 3 行引导（依次尝试
+`${{ github.action_path }}`、`$GITHUB_WORKSPACE/.forgejo`、在仓库内搜索 `*/scripts/run.mjs`）。
+
+可用子命令：`locate-action`、`verify-action`、`install-deps`、`resolve`、`preflight`、`test`、
+`build`、`prepare`、`publish`、`release`、`notify-failure`；都能在本地直接跑，例如
+`GITHUB_WORKSPACE=$PWD node scripts/run.mjs locate-action`。
+
+复制不全会被 `verify-action` 拦下并逐个列出缺哪个文件。
 
 还要在目标仓库里配置：
 
 1. `设置 → Actions`：勾选 **Enable Repository Actions**。
 2. `设置 → Actions → Secrets`：`FORGEJO_TOKEN`、`MESSAGE_PUSHER_TOKEN` 按需（没有 npm token 类配置）。
 3. `设置 → Actions → Variables`：**`MESSAGE_PUSHER_URL`（必填）** —— 推送到哪个地址由仓库配置决定，Action 里不内置任何地址，因此换仓库不会被带到别处。
-4. 该仓库有可用的 `docker` 类型 runner，且 runner 能出网访问 `registry.npmjs.org` 与你的推送地址。
+4. 该仓库有可用的 runner，且 runner 能出网访问 registry 与你的推送地址。
+
+### runner 标签与镜像（重要）
+
+workflow 里的两者都是变量，带默认值，**不配置也能跑**：
+
+```yaml
+    runs-on: ${{ vars.NPM_PUBLISH_RUNNER_LABEL || 'docker' }}
+    container:
+      image: ${{ vars.NPM_PUBLISH_IMAGE || 'node:22-bookworm' }}
+```
+
+对应到 runner 的 `runner-config.yml`：
+
+```yaml
+runner:
+  labels:
+    - docker:docker://node:22-bookworm
+```
+
+规则（依据 [Forgejo Runner 配置文档](https://forgejo.org/docs/latest/admin/actions/configuration/)）：
+
+| 你的 runner 标签 | 是否可跑 |
+| --- | --- |
+| `docker:docker://node:22-bookworm` | ✅ 推荐，默认镜像与 Action 要求一致 |
+| `docker:docker://node:20-bookworm` | ✅ 可以，标签名匹配即可，镜像被 workflow 的 `container.image` 覆盖 |
+| `docker` / `docker:docker` | ✅ 可以，runner 默认镜像就是 `node:22-bookworm`（见 runner 源码 `ArgDocker`） |
+| `docker1:docker://…` | ❌ 标签名必须与 `runs-on` 一致；此时设 `NPM_PUBLISH_RUNNER_LABEL=docker1` 即可 |
+| `docker:lxc://…` | ⚠️ 名字匹配但走 LXC 后端，需要宿主装好 LXC，且模板名要写标准值（如 `debian:bookworm`） |
+
+只有**冒号左边的标签名**参与 `runs-on` 匹配；冒号右边只是**默认镜像**，会被 workflow 的 `container.image` 覆盖（runner 逻辑：`containerImage` 非空优先，否则用标签默认）。
 
 ## 触发方式
 
@@ -67,6 +126,8 @@ dist-tag 默认：正式版 `latest`，含 `-` 的预发布版 `next`；可用�
 
 | 名称 | 默认 | 说明 |
 | --- | --- | --- |
+| `NPM_PUBLISH_RUNNER_LABEL` | `docker` | 覆盖 `runs-on` 的标签名。仓库的 runner 标签叫别的名字（如 `docker1`）时设它 |
+| `NPM_PUBLISH_IMAGE` | `node:22-bookworm` | 覆盖 job 容器镜像。需要内网镜像时设它，例如 `registry.example.com/mirror/node:22-bookworm` |
 | `MESSAGE_PUSHER_URL` | **必填，无默认值** | 通知接收地址，例如 `https://<你的域名>/webhook/<id>`。脚本里不内置任何地址，必须由目标仓库配置；未配置时预检直接失败并提示。含 `/push/` 时按 message-pusher 原生接口发送，否则发送原始 v1 信封 |
 | `NOTIFY_REQUIRED` | `true` | 通知投递最终失败时是否让 job 失败（`false` 只告警） |
 | `NOTIFY_TITLE_REPO_ONLY` | `false` | `true` 时 `title` 只取仓库名（`repo`），默认 `owner/repo` |
@@ -235,9 +296,8 @@ node -e "import('/absolute/path/to/.forgejo/scripts/notify-lib.mjs').then((lib) 
 
 ## 测试
 
-本目录的代码在源仓库 `test/` 下有完整测试（57 个用例，含从 YAML 提取内联程序后真实执行的端到端冒烟）：
+本目录的代码在源仓库 `test/` 下有完整测试（96 个用例，直接 import 这里发布的同一批 `.mjs` 文件，另有把整目录复制成 `.forgejo` 后按真实步骤跑通的端到端用例）：
 
 ```bash
-node test/extract-action-logic.mjs          # 校验 YAML 里的内联程序标记完整
 node --test test/*.test.mjs                 # 运行全部测试
 ```

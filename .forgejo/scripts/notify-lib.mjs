@@ -1,14 +1,14 @@
 // notify-lib — canonical webhook payload/delivery logic for the npm-publish Action.
 //
-// The Action materialises this file next to its inline Node scripts at run time
-// (a heredoc step writes it into $RUNNER_TEMP/npm-publish/), so the scripts can
-// import './notify-lib.mjs'. Keeping the logic here instead of inside the YAML
-// heredocs means the test suite exercises the exact same source the runner uses.
+// This is a normal shipped file: the workflow runs the sibling programs with
+// `node "$forgejo_dir/scripts/<name>.mjs"` and each imports './notify-lib.mjs'.
+// Keeping the logic in files instead of inside YAML heredocs means the test
+// suite exercises the exact same source the runner uses.
 //
 // Payload contract (v1): the top level always carries a non-empty `title` (the
-// repository name) and a non-empty http(s) `url` (the verification/login URL
-// when there is one, otherwise the run page), because the receiving message
-// pusher is configured with the extraction rule {"title": "title", "url": "url"}.
+// repository name) and a `url` holding the authentication link npm printed. A
+// notice is only sent when such a link exists — never a run page or registry
+// origin — because the receiving message pusher extracts {"title","url"}.
 //
 // The destination is supplied by configuration only: this file contains no
 // webhook address, so a copy of the Action never carries one repository's

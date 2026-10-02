@@ -1,5 +1,8 @@
 # npm-publish — tag-triggered npm release with webhook relay for verification URLs.
 #
+# The programs live as real files in <action>/scripts/*.mjs and are executed with
+# `node "$forgejo_dir/scripts/<name>.mjs"`; this file only orchestrates them.
+#
 # Usage: copy this npm-publish/ directory into a target repository, rename it to
 # .forgejo, and the workflow runs there. It only reads the target repository's
 # package.json, lock file, build outputs and git history.
@@ -10,13 +13,9 @@
 # configured webhook as POST application/json, while npm itself keeps polling
 # until the human finishes in the browser.
 #
-# Authentication is manual and interactive: this workflow never uses an npm
-# token. When npm needs a login or a second factor it prints a verification URL,
-# which is forwarded to the configured webhook; the human finishes in the
-# browser and the publish is retried automatically.
 # Repository secrets: MESSAGE_PUSHER_TOKEN (optional), FORGEJO_TOKEN (optional;
-# without it the Forgejo release step is skipped).
-# Authentication is npm's own web flow, relayed to a human:
+# without it the Forgejo release step is skipped). No npm token is used:
+# authentication is npm's own web flow, relayed to a human:
 #   1. not logged in -> `npm login --auth-type=web` prints an auth/cli/<uuid> URL,
 #      which is forwarded; npm keeps polling until the browser login completes;
 #   2. then `npm publish` runs; when a second factor is due npm prints a second
@@ -26,6 +25,8 @@
 # each wait.
 # Repository variable MESSAGE_PUSHER_URL is REQUIRED — the webhook destination is
 # deliberately not shipped with the Action, so each repository supplies its own.
+# Optional NPM_PUBLISH_RUNNER_LABEL (default `docker`) and NPM_PUBLISH_IMAGE
+# (default `node:22-bookworm`) retarget the runner label and the job image.
 # Other optional variables: NOTIFY_REQUIRED, NOTIFY_TITLE_REPO_ONLY,
 # REQUIRED_ARTIFACTS, PKG_TARGET_DIR, SKIP_TEST, SKIP_BUILD, RELEASE_DIST_TAG,
 # NPM_OTP_WAIT_MINUTES.
@@ -68,9 +69,14 @@ defaults:
 jobs:
   release:
     name: npm release
-    runs-on: docker
+    # Both the runner label and the job image are repository variables so a
+    # repository can point at a differently named label or an internal mirror.
+    # Defaults keep the Action working with no configuration: `docker` is the
+    # conventional label name and node:22-bookworm matches the runner's own
+    # default image (see the runner's labels package).
+    runs-on: ${{ vars.NPM_PUBLISH_RUNNER_LABEL || 'docker' }}
     container:
-      image: node:22-bookworm
+      image: ${{ vars.NPM_PUBLISH_IMAGE || 'node:22-bookworm' }}
     timeout-minutes: 60
     env:
       MESSAGE_PUSHER_URL: ${{ vars.MESSAGE_PUSHER_URL }}
@@ -93,828 +99,67 @@ jobs:
         with:
           fetch-depth: 0
 
-      # This repository is NOT used as an `action`, it only carries a workflow, so
-      # Forgejo leaves github.action_path empty (that variable is set only when a
-      # `uses: ./path` local action runs). The copied, renamed directory is a
-      # checkout of the target repository, i.e. $GITHUB_WORKSPACE/.forgejo.
-      # Fall back to a marker-driven search in case checkout used a `path:`.
+      # github.action_path is empty for workflows (it is set only for a
+      # `uses: ./path` local action), so the copied .forgejo directory is found by
+      # the program and published as forgejo_dir. The two lines below only locate
+      # the entry point itself: the real search (nested checkouts, parent mounts,
+      # diagnostics) lives in locate-action.mjs.
       - name: Locate action directory
         id: locate
         run: |
-          set -euo pipefail
-          # Create the staging directory first: the failure-notification step reuses it
-          # even when an earlier step is what failed.
-          stage="$RUNNER_TEMP/npm-publish"
-          mkdir -p "$stage"
-          workspace="${GITHUB_WORKSPACE:-$PWD}"
+          dir="${{ github.action_path }}"
+          [ -f "$dir/scripts/run.mjs" ] || dir="$GITHUB_WORKSPACE/.forgejo"
+          [ -f "$dir/scripts/run.mjs" ] || dir="$(dirname "$(dirname "$(find "$GITHUB_WORKSPACE" -maxdepth 6 -name run.mjs -path '*/scripts/*' -print -quit)")")"
+          node "$dir/scripts/run.mjs" locate-action
 
-          is_action_dir() {
-            [ -d "$1/workflows" ] && [ -f "$1/scripts/notify-lib.mjs" ]
-          }
-
-          candidates=()
-          action_path="${{ github.action_path }}"
-          if [ -n "$action_path" ]; then candidates+=("$action_path"); fi
-          # 1. The documented layout: .forgejo copied to the repository root.
-          candidates+=("$workspace/.forgejo")
-          # 2. Nested or renamed directories: any path that carries both markers. A read
-          #    loop over a process substitution is whitespace-proof and has no heredoc
-          #    terminator that could be re-indented when this script is extracted from YAML.
-          while IFS= read -r found; do
-            if [ -n "$found" ]; then candidates+=("$found"); fi
-          done < <(find "$workspace" -maxdepth 6 -type d -name ".forgejo" -print 2>/dev/null || true)
-          # 3. Last resort: walk up from the workspace (older runners mounted the repository
-          #    next to the workspace rather than inside it). Never scan from the root.
-          walk="$(dirname "$workspace")"
-          for _ in 1 2 3; do
-            if [ "$walk" = "/" ]; then break; fi
-            if [ -d "$walk" ]; then candidates+=("$walk/.forgejo"); fi
-            walk="$(dirname "$walk")"
-          done
-
-          dir=""
-          for candidate in "${candidates[@]}"; do
-            if is_action_dir "$candidate"; then dir="$candidate"; break; fi
-          done
-
-          if [ -z "$dir" ]; then
-            echo "找不到 Action 目录（需要同时存在 workflows/ 与 scripts/notify-lib.mjs）" >&2
-            echo "github.action_path=${action_path}" >&2
-            echo "GITHUB_WORKSPACE=$workspace" >&2
-            echo "--- 工作区内与 action 目录相关的路径 ---" >&2
-            find "$workspace" -maxdepth 5 \( -name ".forgejo*" -o -name "notify-lib.mjs" \) -print 2>/dev/null | head -50 >&2 || true
-            ls -la "$workspace" >&2 || true
-            echo "--- 工作区上级目录 ---" >&2
-            ls -la "$(dirname "$workspace")" >&2 || true
-            exit 1
-          fi
-
-          echo "forgejo_dir=$dir" >> "$GITHUB_OUTPUT"
-          echo "Stage 目录：$stage"
-          echo "Action 目录：$dir"
-
-      # The helper module is a real file (unit-tested directly), staged next to
-      # the generated programs so they can import './notify-lib.mjs'.
-      - name: Stage helper module
+      - name: Verify action scripts
         run: |
-          set -euo pipefail
-          stage="$RUNNER_TEMP/npm-publish"
           dir="${{ steps.locate.outputs.forgejo_dir }}"
-          if [ ! -f "$dir/scripts/notify-lib.mjs" ]; then
-            echo "缺少 $dir/scripts/notify-lib.mjs：Action 目录不完整，请整目录复制 npm-publish/ 后改名为 .forgejo" >&2
-            ls -laR "$dir" >&2 || true
-            exit 1
-          fi
-          mkdir -p "$stage"
-          cp "$dir/scripts/notify-lib.mjs" "$stage/notify-lib.mjs"
-          echo "已暂存 $dir/scripts/notify-lib.mjs → $stage/notify-lib.mjs"
-
-      - name: Extract npm verification URL
-        run: |
-          set -euo pipefail
-          stage="$RUNNER_TEMP/npm-publish"
-          cat > "$stage/verification-parse.mjs" <<'VERIFICATION_PARSE_JS'
-          // >>> verification-parse
-          // Extract the URL npm tells the user to open, from whatever npm printed.
-          //
-          // npm's wording differs per registry and per failure: the hosted registry emits a
-          // modern `auth/cli/<uuid>` challenge, a `401` body can carry an `authUrl` field,
-          // and a custom/internal registry only appears in a `Log in on <registry>` notice.
-          // The relay must forward *npm's own* URL (internal registry included), never a
-          // made-up npmjs.com page.
-          export const VERIFICATION_PATTERNS = [
-            { kind: 'npm-2fa', re: /"authUrl"\s*:\s*"(https?:[^"]+)"/g },
-            { kind: 'npm-2fa', re: /https:\/\/[^\s'"<>()\[\]*`\x00-\x1f]*\/auth\/cli\/[^\s'"<>()\[\]*`\x00-\x1f]*/g },
-            { kind: 'npm-2fa', re: /https:\/\/www\.npmjs\.com\/auth\/cli\/[^\s'"<>()\[\]*`\x00-\x1f]+/g },
-            { kind: 'npm-login-required', re: /https:\/\/www\.npmjs\.com\/(?:login|signup)[^\s'"<>()\[\]*`\x00-\x1f]*/g },
-            { kind: 'npm-login-required', re: /"loginUrl"\s*:\s*"(https?:[^"]+)"/g },
-            { kind: 'npm-login-required', re: /https?:\/\/[^\s'"<>()\[\]*`\x00-\x1f]+\/(?:login|signin|weblogin|web-login|auth)[^\s'"<>()\[\]*`\x00-\x1f]*/g },
-          ];
-
-          /**
-           * `Log in on <registry>` / `Log in at <url>` style notices: take the token after
-           * the keyword, so a bare registry origin (no /login path) is still forwarded.
-           */
-          /**
-           * `Log in on <registry>` / `Log in at <url>` notices. npm writes "Log in" as
-           * two words, so both spellings are accepted, and the token after the keyword is
-           * taken verbatim: a bare registry origin (no /login path) is still a usable URL.
-           */
-          /**
-           * `Log in on <registry>` / `Log in at <url>` notices. npm writes "Log in" as
-           * TWO words, which a token comparison misses — hence the joined-text match. The
-           * token after the preposition is taken verbatim, so a bare registry origin (with
-           * no /login path) is still a usable URL.
-           */
-          export function registryLoginUrl(text) {
-            const cleaned = String(text || '').replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '').replace(/\r/g, '');
-            const match = /(?:^|\s)log\s*[-]?\s*in\s+(?:on|at|to|using|via)\s+(\S+)/i.exec(cleaned);
-            if (!match) return '';
-            const candidate = match[1].replace(/[),.;'"]+$/, '');
-            return /^https?:\/\//.test(candidate) ? candidate : '';
-          }
-
-          export function extractVerificationCode(text) {
-            const labelled = /one[\s-]?tim(?:e|\s)?\s*password\s*(?:is)?\s*[:：]?\s*([0-9]{6,8})\b/i.exec(text || '');
-            if (labelled) return labelled[1];
-            const afterPrompt = /(?:enter otp|otp)\s*[:：]\s*([0-9]{6,8})\b/i.exec(text || '');
-            if (afterPrompt) return afterPrompt[1];
-            const inQuery = /[?&]code=([0-9]{6,8})\b/.exec(text || '');
-            if (inQuery) return inQuery[1];
-            return '';
-          }
-
-          export function parseNpmAuthOutput(text) {
-            const source = String(text || '')
-              .replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '')
-              .replace(/\r/g, '');
-            const candidates = [];
-            const push = (url, kind, priority) => {
-              if (!url || !/^https?:\/\//.test(url)) return;
-              if (candidates.some((entry) => entry.url === url)) return;
-              candidates.push({ url, kind, priority });
-            };
-
-            for (const pattern of VERIFICATION_PATTERNS) {
-              for (const match of source.matchAll(pattern.re)) {
-                // `"authUrl": "…"` / `"loginUrl": "…"` capture the URL in group 1; prose
-                // patterns match the whole URL.
-                push(match[1] || match[0], pattern.kind, pattern.kind === 'npm-2fa' ? 10 : 20);
-              }
-            }
-            // A /login path is a stronger signal than a bare registry origin.
-            for (const candidate of candidates) {
-              if (/\/(?:login|signin|weblogin|web-login|auth)/i.test(candidate.url)) candidate.priority -= 5;
-              if (candidate.url.includes('/auth/cli/')) candidate.priority -= 5;
-            }
-            const fromNotice = registryLoginUrl(source);
-            if (fromNotice) push(fromNotice, 'npm-login-required', 30);
-
-            candidates.sort((a, b) => a.priority - b.priority);
-            const chosen = candidates[0] || { url: '', kind: '' };
-            const code = extractVerificationCode(source);
-            const mentionsSecondFactor =
-              Boolean(code) ||
-              chosen.kind === 'npm-2fa' ||
-              chosen.url.includes('/auth/cli/') ||
-              chosen.url.includes('/login/') ||
-              chosen.url.includes('/auth/') ||
-              /\beotp\b|one[\s-]?time password|verification code/i.test(source);
-            return {
-              url: chosen.url,
-              code,
-              kind: chosen.url ? (mentionsSecondFactor ? 'npm-2fa' : 'npm-login-required') : '',
-            };
-          }
-          // <<< verification-parse
-          VERIFICATION_PARSE_JS
-          node --check "$stage/verification-parse.mjs"
+          node "$dir/scripts/run.mjs" verify-action
 
       - name: Install dependencies
         run: |
-          set -euo pipefail
-          pkg_dir="$GITHUB_WORKSPACE${PKG_TARGET_DIR:+/$PKG_TARGET_DIR}"
-          if [ ! -f "$pkg_dir/package.json" ]; then
-            echo "缺少 package.json：$pkg_dir（monorepo 请设置变量 PKG_TARGET_DIR）" >&2
-            exit 1
-          fi
-          cd "$pkg_dir"
-          if [ -f pnpm-lock.yaml ]; then
-            corepack enable
-            pnpm install --frozen-lockfile
-          elif [ -f yarn.lock ]; then
-            corepack enable
-            yarn install --immutable
-          elif [ -f package-lock.json ]; then
-            npm ci
-          else
-            npm install
-          fi
+          dir="${{ steps.locate.outputs.forgejo_dir }}"
+          node "$dir/scripts/run.mjs" install-deps
 
       - name: Resolve version from tag
         run: |
-          set -euo pipefail
-          stage="$RUNNER_TEMP/npm-publish"
-          cat > "$stage/resolve.mjs" <<'RESOLVE_JS'
-                   // >>> resolve
-                   import { appendFileSync, writeFileSync } from 'node:fs';
-                   import { join } from 'node:path';
-                   import { readOptional } from './notify-lib.mjs';
-
-                   export const SEMVER = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z.-]+)?$/;
-                   export const IS_DIRECT = String(process.argv[1] || '').endsWith('resolve.mjs');
-
-                   export function stripTagPrefix(tag) {
-           let value = String(tag || '').trim();
-           if (value.startsWith('refs/tags/')) value = value.slice('refs/tags/'.length);
-           if (value.startsWith('v')) value = value.slice(1);
-           return value;
-                   }
-
-                   export function tagVersionFromRef(ref) {
-           const match = /^refs\/tags\/(.+)$/.exec(ref || '');
-           return match ? match[1] : '';
-                   }
-
-                   /**
-          * Derive the release identity from the environment. Throws when the tag cannot
-          * be parsed or when a hand-typed version disagrees with the tag that triggered
-          * the run, so a mistyped manual dispatch can never publish the wrong version.
-          */
-                   export function resolveRelease(env = process.env) {
-           const inputVersion = readOptional(env.INPUT_VERSION);
-           const refName = readOptional(env.GITHUB_REF_NAME);
-           const rawTag = inputVersion || refName || tagVersionFromRef(readOptional(env.GITHUB_REF));
-           const version = stripTagPrefix(rawTag);
-           if (!SEMVER.test(version)) throw new Error(`无法从 tag 解析出合法版本号：${rawTag || '<empty>'}`);
-           if (inputVersion && stripTagPrefix(inputVersion) !== stripTagPrefix(refName)) {
-             throw new Error(
-               `手工输入的版本（${inputVersion}）与触发 ref（${refName || '<none>'}）不一致，已中止以避免误发`,
-             );
-           }
-
-           const prerelease = version.includes('-');
-           const repo = env.GITHUB_REPOSITORY || '';
-           const serverUrl = env.GITHUB_SERVER_URL || '';
-           const runNumber = env.GITHUB_RUN_NUMBER || '';
-           const distTag = readOptional(env.INPUT_DIST_TAG) || readOptional(env.RELEASE_DIST_TAG);
-           return {
-             version,
-             tag: rawTag,
-             prerelease,
-             distTag: distTag || (prerelease ? 'next' : 'latest'),
-             dryRun: readOptional(env.INPUT_DRY_RUN).toLowerCase() === 'true',
-             repo,
-             title: repo.split('/').pop() || repo || 'unknown',
-             runUrl: `${serverUrl}/${repo}/actions/runs/${runNumber}`,
-             runNumber,
-             runAttempt: env.GITHUB_RUN_ATTEMPT || '',
-             eventName: env.GITHUB_EVENT_NAME || '',
-             sha: env.GITHUB_SHA || '',
-             serverUrl,
-             apiUrl: env.GITHUB_API_URL || `${serverUrl}/api/v1`,
-             refName: env.GITHUB_REF_NAME || '',
-           };
-                   }
-
-                   if (IS_DIRECT) {
-           const temp = process.env.RUNNER_TEMP || '/tmp';
-           const state = resolveRelease();
-           writeFileSync(join(temp, 'release.json'), JSON.stringify(state, null, 2));
-
-           const emit = (key, value) => {
-             if (process.env.GITHUB_OUTPUT) appendFileSync(process.env.GITHUB_OUTPUT, `${key}=${value}\n`);
-             process.stdout.write(`${key}=${value}\n`);
-           };
-           emit('version', state.version);
-           emit('dist_tag', state.distTag);
-           emit('prerelease', String(state.prerelease));
-           emit('dry_run', String(state.dryRun));
-           emit('title', state.title);
-           emit('run_url', state.runUrl);
-           process.stdout.write(
-             `tag=${state.tag} version=${state.version} dist-tag=${state.distTag} prerelease=${state.prerelease} dry-run=${state.dryRun}\n`,
-           );
-           process.stdout.write(`event=${state.eventName} run=${state.runNumber} attempt=${state.runAttempt} sha=${state.sha}\n`);
-                   }
-                   // <<< resolve
-          RESOLVE_JS
-          cd "$GITHUB_WORKSPACE${PKG_TARGET_DIR:+/$PKG_TARGET_DIR}"
-          node "$stage/resolve.mjs"
+          dir="${{ steps.locate.outputs.forgejo_dir }}"
+          node "$dir/scripts/run.mjs" resolve
 
       - name: Preflight version checks
         run: |
-          set -euo pipefail
-          stage="$RUNNER_TEMP/npm-publish"
-          cat > "$stage/preflight.mjs" <<'PREFLIGHT_JS'
-                   // >>> preflight
-                   import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
-                   import { join } from 'node:path';
-                   import { spawnSync } from 'node:child_process';
-                   import { assertNotifyConfigured, buildPayload, deliver, semverGt, errorSummary, readOptional } from './notify-lib.mjs';
-
-                   export const IS_DIRECT = String(process.argv[1] || '').endsWith('preflight.mjs');
-
-                   export function missingArtifacts(required, exists = existsSync) {
-           return required.filter((item) => !exists(item));
-                   }
-
-                   export function parseRequiredArtifacts(raw) {
-           return String(raw ?? 'lib/index.js,lib/client.js,cordis.patch.yml')
-             .split(',')
-             .map((item) => item.trim())
-             .filter(Boolean);
-                   }
-
-                   export function npmViewJson(spec, run = spawnSync) {
-           const result = run('npm', ['view', spec, '--json'], { encoding: 'utf8' });
-           if (result.status !== 0) return { ok: false, value: null, stderr: result.stderr || '' };
-           try {
-             return { ok: true, value: JSON.parse(result.stdout), stderr: '' };
-           } catch {
-             return { ok: true, value: result.stdout.trim(), stderr: '' };
-           }
-                   }
-
-                   export function publishedVersions(view) {
-           if (!view.ok) return null;
-           return (Array.isArray(view.value) ? view.value : [view.value]).filter((item) => typeof item === 'string');
-                   }
-
-                   /**
-          * Resolve the commit a local tag points at. `rev-parse refs/tags/X` yields the
-          * annotated tag object itself, so peel with `^{commit}` and fall back to the
-          * raw object name for lightweight tags when peeling is unavailable.
-          */
-                   export function resolveTagCommit(tag, run = spawnSync) {
-           const peeled = run('git', ['rev-parse', `refs/tags/${tag}^{commit}`], { encoding: 'utf8' });
-           if (peeled.status === 0 && peeled.stdout.trim()) return peeled.stdout.trim();
-           const raw = run('git', ['rev-parse', `refs/tags/${tag}`], { encoding: 'utf8' });
-           return raw.status === 0 ? raw.stdout.trim() : '';
-                   }
-
-                   async function main() {
-           const temp = process.env.RUNNER_TEMP || '/tmp';
-           const corePath = join(temp, 'release.json');
-           const core = JSON.parse(readFileSync(corePath, 'utf8'));
-
-           const fail = async (reason) => {
-             process.stderr.write(`${reason}\n`);
-             if (!core.dryRun) {
-               try {
-                 await deliver(buildPayload({ phase: 'failed', core, reason }));
-               } catch (error) {
-                 process.stderr.write(`失败通知也未投递成功：${errorSummary(error)}\n`);
-               }
-             }
-             process.exit(1);
-           };
-
-           const pkg = JSON.parse(readFileSync('package.json', 'utf8'));
-           if (pkg.private === true) await fail('package.json 标记为 private: true，不允许发布');
-           if (!pkg.name) await fail('package.json 缺少 name');
-           if (pkg.version !== core.version) {
-             process.stdout.write(`提示：package.json 版本 ${pkg.version} 与 tag 版本 ${core.version} 不一致，prepare 步骤会对齐（不提交）\n`);
-           }
-
-           const missing = missingArtifacts(parseRequiredArtifacts(readOptional(process.env.REQUIRED_ARTIFACTS)));
-           if (missing.length > 0) await fail(`构建产物缺失：${missing.join(', ')}`);
-
-           const tagSha = resolveTagCommit(core.tag);
-           if (!tagSha) await fail(`本地不存在 tag ${core.tag}`);
-           if (core.sha && tagSha !== core.sha) {
-             await fail(`tag ${core.tag} 指向 ${tagSha}，与本次运行的 ${core.sha} 不一致（tag 可能已被移动）`);
-           }
-
-                    // Notification is the only path by which a human can finish an npm
-           // second-factor challenge, so a missing destination is a hard error rather
-           // than a silent skip.
-           try {
-             assertNotifyConfigured(process.env);
-           } catch (error) {
-             await fail(error.message);
-           }
-
-           const state = { ...core, name: pkg.name };
-           const versions = publishedVersions(npmViewJson(`${pkg.name} versions`));
-           if (versions === null) {
-             process.stdout.write(`registry 上查不到 ${pkg.name}，按首次发布处理\n`);
-           } else {
-             if (versions.includes(core.version)) {
-               // Idempotent no-op: the version is already live, so this is a success and
-               // deliberately silent — re-triggering a tag must not spam the chat.
-               process.stdout.write(`registry 上已存在 ${pkg.name}@${core.version}，本次为空操作\n`);
-               process.exit(0);
-             }
-             const latest = versions[versions.length - 1];
-             if (latest && !semverGt(core.version, latest)) {
-               await fail(`版本必须严格大于 registry 上最新版：${core.version} 不大于 ${latest}`);
-             }
-             if (latest) process.stdout.write(`registry 最新版 ${latest} → 本次 ${core.version}\n`);
-           }
-
-           writeFileSync(corePath, JSON.stringify(state, null, 2));
-           if (process.env.GITHUB_OUTPUT) appendFileSync(process.env.GITHUB_OUTPUT, `name=${pkg.name}\n`);
-           process.stdout.write(`预检通过：${pkg.name}@${core.version}（dist-tag=${core.distTag}）\n`);
-                   }
-
-                   if (IS_DIRECT) {
-           try {
-             await main();
-           } catch (error) {
-             process.stderr.write(`预检异常：${errorSummary(error)}\n`);
-             process.exit(1);
-           }
-                   }
-                   // <<< preflight
-          PREFLIGHT_JS
-          cd "$GITHUB_WORKSPACE${PKG_TARGET_DIR:+/$PKG_TARGET_DIR}"
-          node "$stage/preflight.mjs"
+          dir="${{ steps.locate.outputs.forgejo_dir }}"
+          node "$dir/scripts/run.mjs" preflight
 
       - name: Test
-        if: env.SKIP_TEST != 'true'
         run: |
-          set -euo pipefail
-          cd "$GITHUB_WORKSPACE${PKG_TARGET_DIR:+/$PKG_TARGET_DIR}"
-          npm test
+          dir="${{ steps.locate.outputs.forgejo_dir }}"
+          node "$dir/scripts/run.mjs" test
 
       - name: Build
-        if: env.SKIP_BUILD != 'true'
         run: |
-          set -euo pipefail
-          cd "$GITHUB_WORKSPACE${PKG_TARGET_DIR:+/$PKG_TARGET_DIR}"
-          if node -e "process.exit(JSON.parse(require('fs').readFileSync('package.json','utf8')).scripts?.build ? 0 : 1)"; then
-            npm run build
-          else
-            echo "package.json 没有 build 脚本，跳过构建"
-          fi
+          dir="${{ steps.locate.outputs.forgejo_dir }}"
+          node "$dir/scripts/run.mjs" build
 
       - name: Prepare package
         run: |
-          set -euo pipefail
-          stage="$RUNNER_TEMP/npm-publish"
-          cat > "$stage/prepare.mjs" <<'PREPARE_JS'
-                  // >>> prepare
-                  import { readFileSync, writeFileSync } from 'node:fs';
-                  import { join } from 'node:path';
-                  import { spawnSync } from 'node:child_process';
-                  import { buildPayload, deliver, errorSummary, isAuthUrl } from './notify-lib.mjs';
-
-                  export const IS_DIRECT = String(process.argv[1] || '').endsWith('prepare.mjs');
-
-                  export function firstTarballFromPack(stdout) {
-          const parsed = JSON.parse(stdout);
-          const manifest = Array.isArray(parsed) ? parsed[0] : parsed;
-          return { filename: manifest?.filename || '', size: Number(manifest?.size || 0) };
-                  }
-
-                  export function sha256Of(file, run = spawnSync) {
-          if (!file) return '';
-          const digest = run('sha256sum', [file], { encoding: 'utf8' });
-          return digest.status === 0 ? digest.stdout.trim().split(/\s+/)[0] || '' : '';
-                  }
-
-                  async function main() {
-          const temp = process.env.RUNNER_TEMP || '/tmp';
-          const corePath = join(temp, 'release.json');
-          const core = JSON.parse(readFileSync(corePath, 'utf8'));
-
-          const versioned = spawnSync('npm', ['version', core.version, '--no-git-tag-version', '--allow-same-version'], {
-            encoding: 'utf8',
-            env: { ...process.env, npm_config_git_checks: 'false' },
-          });
-          if (versioned.status !== 0) {
-            process.stderr.write(`npm version 失败：\n${versioned.stderr || versioned.stdout}\n`);
-            process.exit(1);
-          }
-
-          const packed = spawnSync('npm', ['pack', '--json'], { encoding: 'utf8' });
-          if (packed.status !== 0) {
-            process.stderr.write(`npm pack 失败：\n${packed.stderr || packed.stdout}\n`);
-            process.exit(1);
-          }
-
-          let tarball;
-          try {
-            tarball = firstTarballFromPack(packed.stdout);
-          } catch (error) {
-            process.stderr.write(`无法解析 npm pack 输出：${error.message}\n`);
-            process.exit(1);
-          }
-          const sha256 = sha256Of(tarball.filename);
-
-          const state = { ...core, tarball: tarball.filename, tarball_bytes: tarball.size, tarball_sha256: sha256 };
-          writeFileSync(corePath, JSON.stringify(state, null, 2));
-          process.stdout.write(`打包完成：${tarball.filename}（${tarball.size} bytes${sha256 ? `，sha256=${sha256}` : ''}）\n`);
-
-          if (!core.dryRun) {
-            try {
-              await deliver(buildPayload({ phase: 'publishing', core: state }));
-            } catch (error) {
-              process.stderr.write(`发布前通知投递失败：${errorSummary(error)}\n`);
-              if (String(process.env.NOTIFY_REQUIRED || 'true').toLowerCase() !== 'false') process.exit(1);
-            }
-          }
-                  }
-
-                  if (IS_DIRECT) {
-          try {
-            await main();
-          } catch (error) {
-            process.stderr.write(`打包异常：${errorSummary(error)}\n`);
-            process.exit(1);
-          }
-                  }
-                  // <<< prepare
-          PREPARE_JS
-          cd "$GITHUB_WORKSPACE${PKG_TARGET_DIR:+/$PKG_TARGET_DIR}"
-          node "$stage/prepare.mjs"
+          dir="${{ steps.locate.outputs.forgejo_dir }}"
+          node "$dir/scripts/run.mjs" prepare
 
       - name: Publish to npm
         run: |
-          set -euo pipefail
-          stage="$RUNNER_TEMP/npm-publish"
-          cat > "$stage/publish.mjs" <<'PUBLISH_JS'
-          // >>> publish
-          import { appendFileSync, readFileSync } from 'node:fs';
-          import { join } from 'node:path';
-          import { spawn } from 'node:child_process';
-          import { buildPayload, deliver, errorSummary, isAuthUrl } from './notify-lib.mjs';
-          import { parseNpmAuthOutput } from './verification-parse.mjs';
-
-          export const IS_DIRECT = String(process.argv[1] || '').endsWith('publish.mjs');
-
-          /**
-           * npm's own web flow returns a one-time URL (`https://www.npmjs.com/auth/cli/<uuid>`)
-           * both for a login and for a second factor, and the npm process has to stay alive
-           * while the human opens it — npm polls the registry and finishes by itself. That
-           * means every npm invocation must run with a TTY: with piped stdin npm refuses the
-           * interactive flow and only prints `E401`, which is why the challenge URL never
-           * reached the user.
-           */
-
-          /** One npm invocation. `usePty` runs it under script(1) so npm sees a terminal. */
-          export function npmCommand(args, { usePty, timeoutSeconds } = {}) {
-            const command = `npm ${args.join(' ')}`;
-            const env = 'BROWSER=true';
-            if (!usePty) return `${env} ${command}`;
-            const binary = process.env.NPM_SCRIPT_BINARY || 'script';
-            const wrapped = `${env} timeout ${timeoutSeconds} ${binary} -q -e -c ${JSON.stringify(command)} /dev/null`;
-            return wrapped;
-          }
-
-          export function hasPty(run) {
-            return run('sh', ['-c', 'command -v script && command -v timeout'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).status === 0;
-          }
-
-          /** Strip the \r doubling and ANSI sequences a PTY introduces. */
-          export function cleanOutput(text) {
-            return String(text || '')
-              .replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '')
-              .replace(/\r/g, '');
-          }
-
-          async function main() {
-            const temp = process.env.RUNNER_TEMP || '/tmp';
-            const core = JSON.parse(readFileSync(join(temp, 'release.json'), 'utf8'));
-            const pkg = JSON.parse(readFileSync('package.json', 'utf8'));
-            const state = { ...core, package: core.name || pkg.name };
-            const waitMinutes = Number(process.env.NPM_AUTH_WAIT_MINUTES || 15);
-            const waitSeconds = Math.max(30, Math.round(waitMinutes * 60));
-            const spawnSync = (await import('node:child_process')).spawnSync;
-            const sleep = (ms) => new Promise((done) => setTimeout(done, ms));
-            const usePty = hasPty(spawnSync);
-
-            // Every URL already forwarded in this run, so the same link is never sent twice.
-            const announced = new Set();
-            const relay = async (text, phase) => {
-              const parsed = parseNpmAuthOutput(text);
-              // Only npm's own authentication link is worth sending: a registry origin or a
-              // repository page would send the reader nowhere useful.
-              if (!parsed.url || !isAuthUrl(parsed.url) || announced.has(parsed.url)) return parsed;
-              announced.add(parsed.url);
-              if (state.dryRun) {
-                process.stdout.write(`dry-run：检测到 ${phase}，未投递（${parsed.url}）\n`);
-                return parsed;
-              }
-              const payload = buildPayload({
-                phase,
-                core: { ...state, package: state.package },
-                auth: { kind: phase, url: parsed.url, code: parsed.code },
-                summary:
-                  phase === 'npm-login-required'
-                    ? `请打开链接完成 npm 登录，登录后会自动继续发布：${parsed.url}`
-                    : `请打开链接完成二次验证，完成后发布即完成：${parsed.url}`,
-              });
-              try {
-                await deliver(payload);
-                process.stdout.write(`已把${phase === 'npm-login-required' ? '登录' : '二次验证'}网址转发到 webhook（${parsed.url}）\n`);
-              } catch (error) {
-                process.stderr.write(`网址转发失败：${errorSummary(error)}\n`);
-                announced.delete(parsed.url);
-              }
-              return parsed;
-            };
-
-            /** Run one npm command under a PTY, relaying challenge URLs as they appear. */
-            const runNpm = (args, { phase, timeoutSeconds }) => {
-              const command = npmCommand(args, { usePty, timeoutSeconds });
-              process.stdout.write(`运行：${command}\n`);
-              return new Promise((resolveRun) => {
-                const child = spawn('sh', ['-c', command], {
-                  env: { ...process.env, BROWSER: 'true', npm_config_git_checks: 'false' },
-                  stdio: ['ignore', 'pipe', 'pipe'],
-                });
-                let captured = '';
-                let pending = '';
-                const handle = (chunk) => {
-                  process.stdout.write(chunk);
-                  captured = `${captured}${chunk}`.slice(-131_072);
-                  pending = cleanOutput(pending + chunk);
-                  const parsed = parseNpmAuthOutput(pending);
-                  if (parsed.url && !announced.has(parsed.url)) {
-                    pending = '';
-                    void relay(captured, phase);
-                  }
-                };
-                child.stdout.on('data', handle);
-                child.stderr.on('data', handle);
-                child.on('error', (error) => {
-                  process.stderr.write(`无法启动 npm：${error.message}\n`);
-                  resolveRun({ code: 127, captured });
-                });
-                child.on('close', (code) => resolveRun({ code: code ?? 1, captured }));
-              });
-            };
-
-            const isAuthenticated = () => {
-              const result = spawnSync('npm', ['whoami'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
-              return result.status === 0 && String(result.stdout || '').trim() !== '';
-            };
-
-            // --- 1. login, if needed: relay npm's own auth/cli URL and wait for the human.
-            if (!state.dryRun && !isAuthenticated()) {
-              process.stdout.write('npm 未登录：发起 npm 网页登录（npm 会给出一次性登录链接）\n');
-              const login = await runNpm(['login', '--auth-type=web'], {
-                phase: 'npm-login-required',
-                timeoutSeconds: waitSeconds,
-              });
-              const loginAuth = parseNpmAuthOutput(cleanOutput(login.captured));
-              if (!loginAuth.url) {
-                process.stderr.write('npm login 没有给出可转发的登录链接，继续尝试直接发布\n');
-              } else if (!isAuthenticated()) {
-                // The login process has exited without credentials: wait for the human and
-                // re-check, so a slow browser confirmation does not force a failure.
-                let waited = 0;
-                const pollMs = Math.min(10_000, Math.max(1000, Number(process.env.NPM_LOGIN_POLL_MINUTES || 5) * 60_000));
-                while (waited < pollMs && !isAuthenticated()) {
-                  await sleep(2000);
-                  waited += 2000;
-                }
-                if (isAuthenticated()) process.stdout.write('检测到 npm 已登录，继续发布\n');
-              } else {
-                process.stdout.write('npm 已登录，继续发布\n');
-              }
-            }
-
-            // --- 2. publish: npm prints a second auth/cli URL when a second factor is due.
-            const baseArgs = ['publish', '--access', 'public', '--tag', state.distTag];
-            if (state.dryRun) baseArgs.push('--dry-run');
-            const attempt = await runNpm(baseArgs, { phase: 'npm-2fa', timeoutSeconds: waitSeconds });
-            const tail = cleanOutput(attempt.captured).slice(-4096);
-
-            if (attempt.code !== 0) {
-              process.stderr.write(`npm publish 以退出码 ${attempt.code} 结束\n`);
-              if (!state.dryRun) {
-                const parsedTail = parseNpmAuthOutput(tail);
-                try {
-                  await deliver(
-                    buildPayload({
-                      phase: 'failed',
-                      core: state,
-                      reason: `npm publish 退出码 ${attempt.code}（认证可能未在 ${waitMinutes} 分钟内完成）`,
-                      auth: parsedTail.url ? parsedTail : undefined,
-                      outputTail: tail,
-                    }),
-                  );
-                } catch (error) {
-                  process.stderr.write(`失败通知投递失败：${errorSummary(error)}\n`);
-                }
-              }
-              process.exit(1);
-            }
-
-            process.stdout.write(`npm publish 结束，退出码 0${state.dryRun ? '（dry-run，未写入 registry）' : ''}\n`);
-            if (process.env.GITHUB_OUTPUT) {
-              appendFileSync(process.env.GITHUB_OUTPUT, `published=${state.dryRun ? 'false' : 'true'}\n`);
-            }
-          }
-
-          if (IS_DIRECT) {
-            try {
-              await main();
-            } catch (error) {
-              process.stderr.write(`发布异常：${errorSummary(error)}\n`);
-              process.exit(1);
-            }
-          }
-          // <<< publish
-          PUBLISH_JS
-          cd "$GITHUB_WORKSPACE${PKG_TARGET_DIR:+/$PKG_TARGET_DIR}"
-          node "$stage/publish.mjs"
+          dir="${{ steps.locate.outputs.forgejo_dir }}"
+          node "$dir/scripts/run.mjs" publish
 
       - name: Create Forgejo release
         if: env.FORGEJO_TOKEN != ''
         run: |
-          set -euo pipefail
-          stage="$RUNNER_TEMP/npm-publish"
-          cat > "$stage/release.mjs" <<'RELEASE_JS'
-                  // >>> release
-                  import { readFileSync } from 'node:fs';
-                  import { join } from 'node:path';
-                  import { spawnSync } from 'node:child_process';
-                  import { buildPayload, deliver, errorSummary, isAuthUrl } from './notify-lib.mjs';
-
-                  export const IS_DIRECT = String(process.argv[1] || '').endsWith('release.mjs');
-
-                  export function buildReleaseBody(core, changelog) {
-          return [
-            `## ${core.package}@${core.version}`,
-            '',
-            `- dist-tag：\`${core.distTag}\``,
-            `- npm：https://www.npmjs.com/package/${core.package}/v/${core.version}`,
-            core.tarball ? `- tarball：\`${core.tarball}\`` : '',
-            core.tarball_sha256 ? `- sha256：\`${core.tarball_sha256}\`` : '',
-            '',
-            '### Commits',
-            '```',
-            changelog,
-            '```',
-            '',
-          ]
-            .filter((line) => line !== '')
-            .join('\n');
-                  }
-
-                  export function gitText(args, run = spawnSync) {
-          const result = run('git', args, { encoding: 'utf8' });
-          return result.status === 0 ? result.stdout.trim() : '';
-                  }
-
-                  async function main() {
-          const temp = process.env.RUNNER_TEMP || '/tmp';
-          const core = JSON.parse(readFileSync(join(temp, 'release.json'), 'utf8'));
-          const state = { ...core, package: core.name || '' };
-          const apiUrl = (state.apiUrl || `${state.serverUrl}/api/v1`).replace(/\/$/, '');
-
-          const previous = gitText(['describe', '--tags', '--abbrev=0', `${state.tag}^`]);
-          const changelog = gitText(['log', '--oneline', previous ? `${previous}..HEAD` : 'HEAD']) || '(没有可列出的提交)';
-
-          const response = await fetch(`${apiUrl}/repos/${state.repo}/releases`, {
-            method: 'POST',
-            headers: { authorization: `token ${process.env.FORGEJO_TOKEN}`, 'content-type': 'application/json' },
-            body: JSON.stringify({
-              tag_name: state.tag,
-              name: `${state.package} ${state.version}`,
-              body: buildReleaseBody(state, changelog),
-              draft: false,
-              prerelease: Boolean(state.prerelease),
-            }),
-          });
-
-          if (response.status === 200 || response.status === 201) {
-            const created = await response.json().catch(() => ({}));
-            process.stdout.write(`已创建 Forgejo Release：${created.html_url || state.tag}\n`);
-          } else if (response.status === 409) {
-            process.stdout.write(`Release ${state.tag} 已存在，跳过创建\n`);
-          } else {
-            process.stderr.write(`创建 Release 失败：HTTP ${response.status} ${await response.text()}\n`);
-            process.exit(1);
-          }
-
-          if (!state.dryRun) {
-            try {
-              await deliver(buildPayload({ phase: 'published', core: state }));
-            } catch (error) {
-              process.stderr.write(`完成通知投递失败：${errorSummary(error)}\n`);
-              if (String(process.env.NOTIFY_REQUIRED || 'true').toLowerCase() !== 'false') process.exit(1);
-            }
-          }
-                  }
-
-                  if (IS_DIRECT) {
-          try {
-            await main();
-          } catch (error) {
-            process.stderr.write(`创建 Release 异常：${errorSummary(error)}\n`);
-            process.exit(1);
-          }
-                  }
-                  // <<< release
-          RELEASE_JS
-          cd "$GITHUB_WORKSPACE${PKG_TARGET_DIR:+/$PKG_TARGET_DIR}"
-          node "$stage/release.mjs"
+          dir="${{ steps.locate.outputs.forgejo_dir }}"
+          node "$dir/scripts/run.mjs" release
 
       - name: Notify failure
         if: failure()
         run: |
-          set -euo pipefail
-          stage="$RUNNER_TEMP/npm-publish"
-          mkdir -p "$stage"
-          cat > "$stage/notify-failure.mjs" <<'NOTIFY_FAILURE_JS'
-          import { existsSync, readFileSync } from 'node:fs';
-          import { join } from 'node:path';
-          import { buildPayload, deliver, errorSummary, isAuthUrl } from './notify-lib.mjs';
-
-          const temp = process.env.RUNNER_TEMP || '/tmp';
-          const corePath = join(temp, 'release.json');
-          const core = existsSync(corePath) ? JSON.parse(readFileSync(corePath, 'utf8')) : {};
-          const payload = buildPayload({ phase: 'failed', core, reason: '工作流在发布完成前失败，请查看 run 日志' });
-          try {
-            await deliver(payload);
-            process.stdout.write(`已投递失败通知（title=${payload.title}, url=${payload.url}）\n`);
-          } catch (error) {
-            process.stderr.write(`失败通知投递失败：${errorSummary(error)}\n`);
-          }
-          NOTIFY_FAILURE_JS
-          node "$stage/notify-failure.mjs"
+          dir="${{ steps.locate.outputs.forgejo_dir }}"
+          node "$dir/scripts/run.mjs" notify-failure
