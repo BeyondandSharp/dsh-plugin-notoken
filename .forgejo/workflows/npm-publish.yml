@@ -10,8 +10,12 @@
 # configured webhook as POST application/json, while npm itself keeps polling
 # until the human finishes in the browser.
 #
-# Repository secrets: NPM_TOKEN (required), MESSAGE_PUSHER_TOKEN (optional),
-# FORGEJO_TOKEN (optional; without it the Forgejo release step is skipped).
+# Authentication is manual and interactive: this workflow never uses an npm
+# token. When npm needs a login or a second factor it prints a verification URL,
+# which is forwarded to the configured webhook; the human finishes in the
+# browser and the publish is retried automatically.
+# Repository secrets: MESSAGE_PUSHER_TOKEN (optional), FORGEJO_TOKEN (optional;
+# without it the Forgejo release step is skipped).
 # Repository variable MESSAGE_PUSHER_URL is REQUIRED — the webhook destination is
 # deliberately not shipped with the Action, so each repository supplies its own.
 # Other optional variables: NOTIFY_REQUIRED, NOTIFY_TITLE_REPO_ONLY,
@@ -75,8 +79,6 @@ jobs:
       INPUT_DRY_RUN: ${{ inputs.dry_run }}
       MESSAGE_PUSHER_TOKEN: ${{ secrets.MESSAGE_PUSHER_TOKEN }}
       FORGEJO_TOKEN: ${{ secrets.FORGEJO_TOKEN }}
-      NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -355,9 +357,7 @@ jobs:
              await fail(`tag ${core.tag} 指向 ${tagSha}，与本次运行的 ${core.sha} 不一致（tag 可能已被移动）`);
            }
 
-           if (!process.env.NPM_TOKEN) await fail('缺少 NPM_TOKEN secret，请先在仓库 secrets 中配置发布令牌');
-
-           // Notification is the only path by which a human can finish an npm
+                    // Notification is the only path by which a human can finish an npm
            // second-factor challenge, so a missing destination is a hard error rather
            // than a silent skip.
            try {
@@ -514,90 +514,172 @@ jobs:
           import { parseNpmAuthOutput } from './verification-parse.mjs';
 
           export const IS_DIRECT = String(process.argv[1] || '').endsWith('publish.mjs');
+          export const REGISTRY = 'https://registry.npmjs.org';
+          export const LOGIN_URL = 'https://www.npmjs.com/login';
+
+          /** `npm whoami` is the cheapest authentication probe available to us. */
+          export function isAuthenticated(run) {
+            const result = run('npm', ['whoami'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+            return result.status === 0 && String(result.stdout || '').trim() !== '';
+          }
+
+          /** Run a command with piped stdio, streaming its output and keeping a tail. */
+          function runStreaming(command, args, { onChunk, env } = {}) {
+            return new Promise((resolve) => {
+              const child = spawn(command, args, {
+                env: { ...process.env, ...env },
+                stdio: ['ignore', 'pipe', 'pipe'],
+              });
+              const handle = (chunk) => {
+                process.stdout.write(chunk);
+                if (onChunk) onChunk(chunk);
+              };
+              child.stdout.setEncoding('utf8');
+              child.stderr.setEncoding('utf8');
+              child.stdout.on('data', handle);
+              child.stderr.on('data', handle);
+              child.on('error', (error) => {
+                process.stderr.write(`无法启动 ${command}：${error.message}\n`);
+                resolve(127);
+              });
+              child.on('close', (code) => resolve(code ?? 1));
+            });
+          }
+
+          /** Split notification text so the on-screen summary stays readable. */
+          function notificationSummary(kind, waitMinutes, url) {
+            const lead = kind === 'npm-login-required' ? 'npm 需要登录授权' : 'npm 要求二次验证';
+            return `${lead}，请在 ${waitMinutes} 分钟内完成：${url}`;
+          }
 
           async function main() {
             const temp = process.env.RUNNER_TEMP || '/tmp';
             const core = JSON.parse(readFileSync(join(temp, 'release.json'), 'utf8'));
             const pkg = JSON.parse(readFileSync('package.json', 'utf8'));
             const state = { ...core, package: core.name || pkg.name };
-            const waitMinutes = Number(process.env.NPM_OTP_WAIT_MINUTES || 10);
-            const notified = { value: false };
-            const captured = [];
+            const waitMinutes = Number(process.env.NPM_AUTH_WAIT_MINUTES || 15);
+            const deadline = Date.now() + waitMinutes * 60_000;
 
-            const remember = (chunk) => {
-              captured.push(chunk);
-              while (captured.join('').length > 65_536 && captured.length > 1) captured.shift();
+            const sleep = (ms) => new Promise((resolveWait) => setTimeout(resolveWait, ms));
+            // Focus only on the fresh output of the current npm invocation when
+            // searching for a URL: otherwise a stale link from a previous attempt would be
+            // re-forwarded instead of the current one.
+            let scanning = false;
+            let buffer = '';
+            let announced = '';
+            const clearBuffer = () => {
+              buffer = '';
+            };
+            const feed = (chunk) => {
+              if (!scanning) return;
+              buffer = `${buffer}${chunk}`.slice(-65_536);
             };
 
-            const announceAuth = async (parsed, reason) => {
-              if (notified.value) return;
-              notified.value = true;
+            const announce = async (parsed, kind, reason) => {
+              const url = parsed.url;
+              if (!url || announced === url) return;
               if (state.dryRun) {
-                process.stdout.write('dry-run：检测到二次验证提示，未投递 webhook\n');
+                process.stdout.write(`dry-run：检测到 ${kind}，未投递 webhook（${url}）\n`);
+                announced = url;
                 return;
               }
               const payload = buildPayload({
-                phase: parsed.kind || 'npm-2fa',
+                phase: kind,
                 core: state,
-                auth: { kind: parsed.kind || 'npm-2fa', url: parsed.url, code: parsed.code },
-                summary: `${reason}，请在 ${waitMinutes} 分钟内完成：${parsed.url || '见 workflow 日志中的原始输出'}`,
+                auth: { kind, url, code: parsed.code },
+                summary: notificationSummary(kind, waitMinutes, url),
               });
               try {
                 await deliver(payload);
-                process.stdout.write(`已把验证网址转发到 webhook（title=${payload.title}）\n`);
+                announced = url;
+                process.stdout.write(`已把验证网址转发到 webhook（title=${payload.title}, kind=${kind}）\n`);
               } catch (error) {
                 process.stderr.write(`验证网址转发失败：${errorSummary(error)}\n`);
               }
             };
 
-            const args = ['publish', '--access', 'public', '--tag', state.distTag];
-            const otp = readOptional(process.env.INPUT_OTP);
-            if (otp) args.push('--otp', otp);
-            if (state.dryRun) args.push('--dry-run');
-            process.stdout.write(`运行：npm ${args.join(' ')}\n`);
-
-            const child = spawn('npm', args, {
-              env: { ...process.env, npm_config_git_checks: 'false' },
-              stdio: ['ignore', 'pipe', 'pipe'],
-            });
-
-            let announced = false;
-            const handleChunk = (chunk) => {
-              remember(chunk);
-              const parsed = parseNpmAuthOutput(captured.join('').slice(-65_536));
-              if (parsed.url && !announced) {
-                announced = true;
-                void announceAuth(parsed, 'npm 要求二次验证或登录');
-              }
-            };
-
-            for (const stream of ['stdout', 'stderr']) {
-              child[stream].setEncoding('utf8');
-              child[stream].on('data', (chunk) => {
-                process.stdout.write(chunk);
-                handleChunk(chunk);
-              });
+            const spawnSyncSafe = (await import('node:child_process')).spawnSync;
+            const authenticated = isAuthenticated(spawnSyncSafe);
+            process.stdout.write(`npm 认证状态：${authenticated ? '已登录' : '未登录（需要人工授权）'}\n`);
+            if (!authenticated && !state.dryRun) {
+              // npm cannot print a web-login URL without a TTY, so the first push tells the
+              // human where to sign in; the retry loop below reports the exact challenge
+              // URL once npm emits one.
+              await announce(
+                { url: LOGIN_URL, code: '', kind: 'npm-login-required' },
+                'npm-login-required',
+                '当前 runner 未登录 npm',
+              );
             }
 
-            const exitCode = await new Promise((resolveCode) => {
-              child.on('error', (error) => {
-                process.stderr.write(`无法启动 npm：${error.message}\n`);
-                resolveCode(127);
-              });
-              child.on('close', (code) => resolveCode(code ?? 1));
-            });
+            const baseArgs = ['publish', '--access', 'public', '--tag', state.distTag];
+            if (state.dryRun) baseArgs.push('--dry-run');
 
-            if (exitCode !== 0) {
-              process.stderr.write(`npm publish 以退出码 ${exitCode} 结束\n`);
+            let attempt = 0;
+            let lastExit = 1;
+            // `--otp` is taken from the manual input when provided, otherwise from
+            // the code npm embedded in a previous challenge URL.
+            let discoveredOtp = '';
+            while (attempt < 6) {
+              attempt += 1;
+              const args = [...baseArgs];
+              const otp = readOptional(process.env.INPUT_OTP) || discoveredOtp;
+              if (otp) args.push('--otp', otp);
+              process.stdout.write(`第 ${attempt} 次运行：npm ${args.join(' ')}\n`);
+
+              scanning = true;
+              clearBuffer();
+              lastExit = await runStreaming('npm', args, {
+                env: { npm_config_git_checks: 'false' },
+                onChunk: (chunk) => {
+                  feed(chunk);
+                  const parsed = parseNpmAuthOutput(buffer);
+                  if (parsed.url) {
+                    scanning = false;
+                    void announce(parsed, parsed.kind || 'npm-2fa', 'npm 要求完成认证');
+                  }
+                },
+              });
+              scanning = false;
+
+              if (state.dryRun) break;
+
+              const parsedFinal = parseNpmAuthOutput(buffer);
+              if (lastExit === 0) break;
+
+              // Any auth URL means npm wants a human; wait, then retry so a completed login
+              // or second factor is picked up. Retrying is harmless after a real failure.
+              const code = parsedFinal.code;
+              if (code) discoveredOtp = code;
+              // A completed login/2FA is picked up by the next attempt, so the
+              // delay only needs to be long enough not to hammer the registry.
+              // NPM_AUTH_RETRY_DELAY_SECONDS overrides it (used by the tests).
+              const configuredDelay = Number(process.env.NPM_AUTH_RETRY_DELAY_SECONDS || 0);
+              const waitMs = Number.isFinite(configuredDelay) && configuredDelay > 0
+                ? configuredDelay * 1000
+                : (code ? 5000 : Math.min(30_000, deadline - Date.now()));
+              if (waitMs > 0 && Date.now() < deadline) {
+                process.stdout.write(
+                  code
+                    ? `已从网址拿到验证码，${waitMs / 1000}s 后重试\n`
+                    : `等待人工完成认证（剩余 ${Math.round((deadline - Date.now()) / 60000)} 分钟），${waitMs / 1000}s 后重试\n`,
+                );
+                await sleep(waitMs);
+              }
+              if (Date.now() >= deadline) break;
+            }
+
+            if (lastExit !== 0) {
+              process.stderr.write(`npm publish 以退出码 ${lastExit} 结束\n`);
               if (!state.dryRun) {
-                const tail = captured.join('').slice(-4096);
+                const tail = buffer.slice(-4096);
                 const parsedTail = parseNpmAuthOutput(tail);
                 try {
                   await deliver(
                     buildPayload({
                       phase: 'failed',
                       core: state,
-                      reason: `npm publish 退出码 ${exitCode}`,
+                      reason: `npm publish 退出码 ${lastExit}（认证可能未在限定时间内完成）`,
                       auth: parsedTail.url ? parsedTail : undefined,
                       outputTail: tail,
                     }),
@@ -647,6 +729,16 @@ jobs:
             {
               kind: 'npm-login-required',
               re: /https:\/\/[^\s'"<>()\[\]*`]*npmjs\.(?:com|org)\/(?:login|auth|signup)[^\s'"<>()\[\]*`]*/g,
+            },
+            // Unauthenticated publish: npm prints a `Log in on <registry>` notice plus
+            // a link, and the 401 body can carry an `authUrl` field.
+            {
+              kind: 'npm-login-required',
+              re: /"authUrl"\s*:\s*"(https:[^"]+)"/g,
+            },
+            {
+              kind: 'npm-login-required',
+              re: /https:\/\/[^\s'"<>()\[\]*`]+\/(?:login|signin|auth)[^\s'"<>()\[\]*`]*/g,
             },
           ];
 

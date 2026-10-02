@@ -6,13 +6,18 @@ Forgejo Action：**推送 tag 即发版**。流程参照仓库根目录的 `rele
 push tag v1.4.0
       │
       ├─ 解析版本（tag 即版本）             resolve
-      ├─ 预检：private/产物/tag 未移动/registry 版本比对/token   preflight
+      ├─ 预检：private/产物/tag 未移动/registry 版本比对   preflight
       ├─ 测试、构建、npm pack + sha256      Test / Build / prepare
+      ├─ npm whoami → 未登录就把登录网址推给用户
       ├─ npm publish（--access public --tag <dist-tag>）        publish
-      │     └─ 出现验证网址 → POST 到 webhook（title=仓库名, url=网址）
+      │     ├─ 需要登录/二次验证 → 把 npm 打印的网址 POST 到 webhook
+      │     ├─ 等待用户在浏览器完成（默认 15 分钟窗口）
+      │     └─ 自动重试发布（网址里带验证码时直接用码重试）
       ├─ 创建 Forgejo Release（changelog）   release
       └─ 任一步失败 → 推送 failed 通知（url 回退为 run 页面）
 ```
+
+**不需要任何 npm token**：认证完全由人工完成，runner 里不保存凭据。
 
 ## 安装
 
@@ -33,7 +38,7 @@ cp -r npm-publish /path/to/target-repo/.forgejo
 还要在目标仓库里配置：
 
 1. `设置 → Actions`：勾选 **Enable Repository Actions**。
-2. `设置 → Actions → Secrets`：至少 `NPM_TOKEN`（见下表）。
+2. `设置 → Actions → Secrets`：`FORGEJO_TOKEN`、`MESSAGE_PUSHER_TOKEN` 按需（没有 npm token 类配置）。
 3. `设置 → Actions → Variables`：**`MESSAGE_PUSHER_URL`（必填）** —— 推送到哪个地址由仓库配置决定，Action 里不内置任何地址，因此换仓库不会被带到别处。
 4. 该仓库有可用的 `docker` 类型 runner，且 runner 能出网访问 `registry.npmjs.org` 与你的推送地址。
 
@@ -52,9 +57,10 @@ dist-tag 默认：正式版 `latest`，含 `-` 的预发布版 `next`；可用�
 
 | 名称 | 必需 | 说明 |
 | --- | --- | --- |
-| `NPM_TOKEN` | 是 | npm 发布令牌。**推荐 Automation token 或 Granular token（Bypass 2FA）**，可完全免 OTP；同时以 `NODE_AUTH_TOKEN` 注入给 npm |
 | `FORGEJO_TOKEN` | 否 | 建 Forgejo Release 用的 PAT（仓库写权限）。未配置时自动跳过建 Release，只发 npm |
 | `MESSAGE_PUSHER_TOKEN` | 否 | 你的推送服务设了 token 时填写；自定义 Webhook 下会作为 `Authorization: Bearer` 发送 |
+
+> 没有任何 npm 凭据类 secret：`NPM_TOKEN` / `NODE_AUTH_TOKEN` 都不需要，工作流不读取、也不传递它们。
 
 ### Variables
 
@@ -68,7 +74,8 @@ dist-tag 默认：正式版 `latest`，含 `-` 的预发布版 `next`；可用�
 | `SKIP_TEST` | 空 | `true` 跳过 `npm test` |
 | `SKIP_BUILD` | 空 | `true` 跳过 `npm run build`（无 build 脚本时自动跳过） |
 | `RELEASE_DIST_TAG` | 空 | 固定 dist-tag |
-| `NPM_OTP_WAIT_MINUTES` | `10` | 验证网址在推送文案里提示的有效期（仅文案提示，npm 自身轮询为准） |
+| `NPM_AUTH_WAIT_MINUTES` | `15` | 等待人工完成登录/二次验证的总时长；超时后发布失败并推送 `failed` |
+| `NPM_AUTH_RETRY_DELAY_SECONDS` | 空 | 每次重试之间的等待秒数（默认 30s；从网址拿到验证码时 5s）。主要给测试用 |
 
 ## webhook 载荷契约（v1）
 
@@ -106,7 +113,9 @@ dist-tag 默认：正式版 `latest`，含 `-` 的预发布版 `next`；可用�
 }
 ```
 
-`phase` 取值：`starting`、`publishing`、`npm-2fa`、`npm-login-required`、`published`、`failed`。（版本已存在时按幂等成功静默退出，不推送，避免重复推 tag 刷屏。）
+`phase` 取值：`publishing`、`npm-2fa`、`npm-login-required`、`published`、`failed`。（版本已存在时按幂等成功静默退出，不推送，避免重复推 tag 刷屏。）
+
+`npm-login-required` 出现两次是正常的但**只会推送一次**：开始时 `npm whoami` 失败会先推登录页；随后 `npm publish` 返回的 401 挑战网址通常就是同一个登录页，重复网址会被去重。
 
 ### 接收端配置（message-pusher 自定义 Webhook）
 
@@ -195,7 +204,7 @@ node -e "import('/absolute/path/to/.forgejo/scripts/notify-lib.mjs').then((lib) 
 | --- | --- |
 | `未配置通知地址` | 在 `设置 → Actions → Variables` 里加 `MESSAGE_PUSHER_URL`（本 Action 不内置地址） |
 | `找不到 Action 目录` | 确认 `.forgejo/` 整目录在仓库里（含 `workflows/` 与 `scripts/notify-lib.mjs`）；报错里会列出实际找到的路径 |
-| `缺少 NPM_TOKEN secret` | 在仓库 secrets 里配置 `NPM_TOKEN`（Automation / Granular token 均可） |
+| `npm 认证状态：未登录` | 正常现象：把推送里的登录网址在浏览器打开完成登录；工作流会在等待窗口内自动重试 |
 | `版本必须严格大于 registry 上最新版` | tag 版本比 npm 上的旧；删掉 tag 换新版本，或确认是否想重发 |
 | `构建产物缺失` | 检查 `REQUIRED_ARTIFACTS`，或该项目的产物路径 |
 | 收不到推送 | 检查 `MESSAGE_PUSHER_URL` 与（如需要）`MESSAGE_PUSHER_TOKEN`；把 `NOTIFY_REQUIRED` 设 `false` 可先不让它阻塞发布 |
