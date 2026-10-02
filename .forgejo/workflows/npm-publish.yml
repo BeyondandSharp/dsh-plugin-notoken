@@ -99,7 +99,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
+          # Full history for the changelog; fetch-tags because a tag-triggered
+          # checkout does not necessarily materialise refs/tags/<tag>, and the
+          # version check below uses it when it is available.
           fetch-depth: 0
+          fetch-tags: true
 
       # github.action_path is empty for workflows (it is set only for a
       # `uses: ./path` local action), so the copied .forgejo directory is found by

@@ -54,6 +54,26 @@ export function resolveTagCommit(tag, run = spawnSync) {
   return raw.status === 0 ? raw.stdout.trim() : '';
 }
 
+/**
+ * Best-effort fetch of one tag from origin, used only when the checkout did not
+ * bring refs/tags. Failure is not fatal: the release identity comes from the
+ * event, and this helper exists to catch a tag that was moved.
+ */
+export function fetchTagFromOrigin(tag, run = spawnSync) {
+  if (!tag) return false;
+  const remote = run('git', ['remote'], { encoding: 'utf8' });
+  if (remote.status !== 0 || !String(remote.stdout || '').trim()) return false;
+  const name = String(remote.stdout)
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)[0];
+  const result = run('git', ['fetch', '--tags', '--force', name, `refs/tags/${tag}:refs/tags/${tag}`], {
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  return result.status === 0;
+}
+
 async function main() {
   const temp = process.env.RUNNER_TEMP || '/tmp';
   const corePath = join(temp, 'release.json');
@@ -81,9 +101,22 @@ async function main() {
   const missing = missingArtifacts(parseRequiredArtifacts(readOptional(process.env.REQUIRED_ARTIFACTS)));
   if (missing.length > 0) await fail(`构建产物缺失：${missing.join(', ')}`);
 
+  // Tag verification is best effort: a tag-triggered checkout frequently has no
+  // refs/tags/<tag> (detached commit, clone without --tags), so a missing tag
+  // must not block the release. When the tag is visible it is still compared with
+  // the run's commit, which catches a tag moved after the trigger.
+  if (!resolveTagCommit(core.tag)) {
+    if (fetchTagFromOrigin(core.tag)) {
+      process.stdout.write(`已从远端取回 tag ${core.tag} 用于校验\n`);
+    } else {
+      process.stdout.write(
+        `提示：本地没有 refs/tags/${core.tag}（checkout 未取 tags），跳过"tag 未移动"校验；` +
+          `发布标识以本次运行的 ${core.sha} 为准\n`,
+      );
+    }
+  }
   const tagSha = resolveTagCommit(core.tag);
-  if (!tagSha) await fail(`本地不存在 tag ${core.tag}`);
-  if (core.sha && tagSha !== core.sha) {
+  if (tagSha && core.sha && tagSha !== core.sha) {
     await fail(`tag ${core.tag} 指向 ${tagSha}，与本次运行的 ${core.sha} 不一致（tag 可能已被移动）`);
   }
 
