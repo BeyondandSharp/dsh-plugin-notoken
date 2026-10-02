@@ -32,6 +32,22 @@ export const PHASES = new Set([
 
 const RETRYABLE = new Set([408, 425, 429, 500, 502, 503, 504]);
 
+/**
+ * Read an optional value from the environment: whitespace-only and *unexpanded*
+ * expression text count as "not provided".
+ *
+ * Forgejo does not always substitute `${{ inputs.x }}` / `${{ vars.x }}` in the
+ * job environment when the workflow was triggered by an event that defines no
+ * inputs (a tag push). The literal text then reaches the programs, and treating
+ * it as a real value breaks releases with errors like
+ * "无法从 tag 解析出合法版本号：${{ inputs.version }}".
+ */
+export function readOptional(value) {
+  const text = String(value ?? '').trim();
+  if (!text) return '';
+  return text.includes('${{') ? '' : text;
+}
+
 export function isHttpUrl(value) {
   return typeof value === 'string' && /^https?:\/\/\S+$/i.test(value);
 }

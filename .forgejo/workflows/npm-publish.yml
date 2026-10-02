@@ -92,8 +92,8 @@ jobs:
         id: locate
         run: |
           set -euo pipefail
-          # Create the staging directory first: the failure-notification step
-          # reuses it even when an earlier step is what failed.
+          # Create the staging directory first: the failure-notification step reuses it
+          # even when an earlier step is what failed.
           stage="$RUNNER_TEMP/npm-publish"
           mkdir -p "$stage"
           workspace="${GITHUB_WORKSPACE:-$PWD}"
@@ -103,39 +103,36 @@ jobs:
           }
 
           candidates=()
-          if [ -n "${{ github.action_path }}" ]; then
-            candidates+=("${{ github.action_path }}")
-          fi
+          action_path="${{ github.action_path }}"
+          if [ -n "$action_path" ]; then candidates+=("$action_path"); fi
           # 1. The documented layout: .forgejo copied to the repository root.
           candidates+=("$workspace/.forgejo")
-          # 2. Nested or renamed directories: any path that carries both markers.
-          #    A read loop over a process substitution is whitespace-proof without
-          #    a heredoc terminator that could be re-indented when the script is
-          #    extracted from this YAML file.
+          # 2. Nested or renamed directories: any path that carries both markers. A read
+          #    loop over a process substitution is whitespace-proof and has no heredoc
+          #    terminator that could be re-indented when this script is extracted from YAML.
           while IFS= read -r found; do
             if [ -n "$found" ]; then candidates+=("$found"); fi
-          done < <(find "$workspace" -maxdepth 6 -type d -name '.forgejo' -print 2>/dev/null || true)
-          # 3. Last resort: walk up from the workspace (older runners mounted the
-          #    repository next to the workspace rather than inside it). Guard the
-          #    loop so it never scans from the filesystem root.
+          done < <(find "$workspace" -maxdepth 6 -type d -name ".forgejo" -print 2>/dev/null || true)
+          # 3. Last resort: walk up from the workspace (older runners mounted the repository
+          #    next to the workspace rather than inside it). Never scan from the root.
           walk="$(dirname "$workspace")"
           for _ in 1 2 3; do
-            if [ "$walk" = '/' ]; then break; fi
+            if [ "$walk" = "/" ]; then break; fi
             if [ -d "$walk" ]; then candidates+=("$walk/.forgejo"); fi
             walk="$(dirname "$walk")"
           done
 
-          dir=''
+          dir=""
           for candidate in "${candidates[@]}"; do
             if is_action_dir "$candidate"; then dir="$candidate"; break; fi
           done
 
           if [ -z "$dir" ]; then
             echo "找不到 Action 目录（需要同时存在 workflows/ 与 scripts/notify-lib.mjs）" >&2
-            echo "github.action_path='${{ github.action_path }}'" >&2
+            echo "github.action_path=${action_path}" >&2
             echo "GITHUB_WORKSPACE=$workspace" >&2
             echo "--- 工作区内与 action 目录相关的路径 ---" >&2
-            find "$workspace" -maxdepth 5 \( -name '.forgejo*' -o -name 'notify-lib.mjs' \) -print 2>/dev/null | head -50 >&2 || true
+            find "$workspace" -maxdepth 5 \( -name ".forgejo*" -o -name "notify-lib.mjs" \) -print 2>/dev/null | head -50 >&2 || true
             ls -la "$workspace" >&2 || true
             echo "--- 工作区上级目录 ---" >&2
             ls -la "$(dirname "$workspace")" >&2 || true
@@ -191,6 +188,7 @@ jobs:
                    // >>> resolve
                    import { appendFileSync, writeFileSync } from 'node:fs';
                    import { join } from 'node:path';
+                   import { readOptional } from './notify-lib.mjs';
 
                    export const SEMVER = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z.-]+)?$/;
                    export const IS_DIRECT = String(process.argv[1] || '').endsWith('resolve.mjs');
@@ -213,12 +211,14 @@ jobs:
           * the run, so a mistyped manual dispatch can never publish the wrong version.
           */
                    export function resolveRelease(env = process.env) {
-           const rawTag = env.INPUT_VERSION || env.GITHUB_REF_NAME || tagVersionFromRef(env.GITHUB_REF);
+           const inputVersion = readOptional(env.INPUT_VERSION);
+           const refName = readOptional(env.GITHUB_REF_NAME);
+           const rawTag = inputVersion || refName || tagVersionFromRef(readOptional(env.GITHUB_REF));
            const version = stripTagPrefix(rawTag);
            if (!SEMVER.test(version)) throw new Error(`无法从 tag 解析出合法版本号：${rawTag || '<empty>'}`);
-           if (env.INPUT_VERSION && stripTagPrefix(env.INPUT_VERSION) !== stripTagPrefix(env.GITHUB_REF_NAME || '')) {
+           if (inputVersion && stripTagPrefix(inputVersion) !== stripTagPrefix(refName)) {
              throw new Error(
-               `手工输入的版本（${env.INPUT_VERSION}）与触发 ref（${env.GITHUB_REF_NAME || '<none>'}）不一致，已中止以避免误发`,
+               `手工输入的版本（${inputVersion}）与触发 ref（${refName || '<none>'}）不一致，已中止以避免误发`,
              );
            }
 
@@ -226,12 +226,13 @@ jobs:
            const repo = env.GITHUB_REPOSITORY || '';
            const serverUrl = env.GITHUB_SERVER_URL || '';
            const runNumber = env.GITHUB_RUN_NUMBER || '';
+           const distTag = readOptional(env.INPUT_DIST_TAG) || readOptional(env.RELEASE_DIST_TAG);
            return {
              version,
              tag: rawTag,
              prerelease,
-             distTag: env.INPUT_DIST_TAG || env.RELEASE_DIST_TAG || (prerelease ? 'next' : 'latest'),
-             dryRun: String(env.INPUT_DRY_RUN || '').toLowerCase() === 'true',
+             distTag: distTag || (prerelease ? 'next' : 'latest'),
+             dryRun: readOptional(env.INPUT_DRY_RUN).toLowerCase() === 'true',
              repo,
              title: repo.split('/').pop() || repo || 'unknown',
              runUrl: `${serverUrl}/${repo}/actions/runs/${runNumber}`,
@@ -279,7 +280,7 @@ jobs:
                    import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
                    import { join } from 'node:path';
                    import { spawnSync } from 'node:child_process';
-                   import { assertNotifyConfigured, buildPayload, deliver, semverGt, errorSummary } from './notify-lib.mjs';
+                   import { assertNotifyConfigured, buildPayload, deliver, semverGt, errorSummary, readOptional } from './notify-lib.mjs';
 
                    export const IS_DIRECT = String(process.argv[1] || '').endsWith('preflight.mjs');
 
@@ -345,7 +346,7 @@ jobs:
              process.stdout.write(`提示：package.json 版本 ${pkg.version} 与 tag 版本 ${core.version} 不一致，prepare 步骤会对齐（不提交）\n`);
            }
 
-           const missing = missingArtifacts(parseRequiredArtifacts(process.env.REQUIRED_ARTIFACTS));
+           const missing = missingArtifacts(parseRequiredArtifacts(readOptional(process.env.REQUIRED_ARTIFACTS)));
            if (missing.length > 0) await fail(`构建产物缺失：${missing.join(', ')}`);
 
            const tagSha = resolveTagCommit(core.tag);
@@ -505,125 +506,124 @@ jobs:
           set -euo pipefail
           stage="$RUNNER_TEMP/npm-publish"
           cat > "$stage/publish.mjs" <<'PUBLISH_JS'
-                  // >>> publish
-                  import { appendFileSync, readFileSync } from 'node:fs';
-                  import { join } from 'node:path';
-                  import { spawn } from 'node:child_process';
-                  import { buildPayload, deliver, errorSummary } from './notify-lib.mjs';
+          // >>> publish
+          import { appendFileSync, readFileSync } from 'node:fs';
+          import { join } from 'node:path';
+          import { spawn } from 'node:child_process';
+          import { buildPayload, deliver, errorSummary, readOptional } from './notify-lib.mjs';
           import { parseNpmAuthOutput } from './verification-parse.mjs';
 
-                  export const IS_DIRECT = String(process.argv[1] || '').endsWith('publish.mjs');
+          export const IS_DIRECT = String(process.argv[1] || '').endsWith('publish.mjs');
 
+          async function main() {
+            const temp = process.env.RUNNER_TEMP || '/tmp';
+            const core = JSON.parse(readFileSync(join(temp, 'release.json'), 'utf8'));
+            const pkg = JSON.parse(readFileSync('package.json', 'utf8'));
+            const state = { ...core, package: core.name || pkg.name };
+            const waitMinutes = Number(process.env.NPM_OTP_WAIT_MINUTES || 10);
+            const notified = { value: false };
+            const captured = [];
 
-                  async function main() {
-          const temp = process.env.RUNNER_TEMP || '/tmp';
-          const core = JSON.parse(readFileSync(join(temp, 'release.json'), 'utf8'));
-          const pkg = JSON.parse(readFileSync('package.json', 'utf8'));
-          const state = { ...core, package: core.name || pkg.name };
-          const waitMinutes = Number(process.env.NPM_OTP_WAIT_MINUTES || 10);
-          const notified = { value: false };
-          const captured = [];
+            const remember = (chunk) => {
+              captured.push(chunk);
+              while (captured.join('').length > 65_536 && captured.length > 1) captured.shift();
+            };
 
-          const remember = (chunk) => {
-            captured.push(chunk);
-            while (captured.join('').length > 65_536 && captured.length > 1) captured.shift();
-          };
-
-          const announceAuth = async (parsed, reason) => {
-            if (notified.value) {
-              process.stdout.write('本次运行已投递过验证提示，跳过重复通知\n');
-              return;
-            }
-            notified.value = true;
-            if (state.dryRun) {
-              process.stdout.write('dry-run：检测到二次验证提示，未投递 webhook\n');
-              return;
-            }
-            const payload = buildPayload({
-              phase: parsed.kind || 'npm-2fa',
-              core: state,
-              auth: { kind: parsed.kind || 'npm-2fa', url: parsed.url, code: parsed.code },
-              summary: `${reason}，请在 ${waitMinutes} 分钟内完成：${parsed.url || '见 workflow 日志中的原始输出'}`,
-            });
-            try {
-              await deliver(payload);
-              process.stdout.write(`已把验证网址转发到 webhook（title=${payload.title}）\n`);
-            } catch (error) {
-              process.stderr.write(`验证网址转发失败：${errorSummary(error)}\n`);
-            }
-          };
-
-          const args = ['publish', '--access', 'public', '--tag', state.distTag];
-          if (process.env.INPUT_OTP) args.push('--otp', process.env.INPUT_OTP);
-          if (state.dryRun) args.push('--dry-run');
-          process.stdout.write(`运行：npm ${args.join(' ')}\n`);
-
-          const child = spawn('npm', args, {
-            env: { ...process.env, npm_config_git_checks: 'false' },
-            stdio: ['ignore', 'pipe', 'pipe'],
-          });
-
-          let announced = false;
-          const handleChunk = (chunk) => {
-            remember(chunk);
-            const parsed = parseNpmAuthOutput(captured.join('').slice(-65_536));
-            if (parsed.url && !announced) {
-              announced = true;
-              void announceAuth(parsed, 'npm 要求二次验证或登录');
-            }
-          };
-
-          for (const stream of ['stdout', 'stderr']) {
-            child[stream].setEncoding('utf8');
-            child[stream].on('data', (chunk) => {
-              process.stdout.write(chunk);
-              handleChunk(chunk);
-            });
-          }
-
-          const exitCode = await new Promise((resolveCode) => {
-            child.on('error', (error) => {
-              process.stderr.write(`无法启动 npm：${error.message}\n`);
-              resolveCode(127);
-            });
-            child.on('close', (code) => resolveCode(code ?? 1));
-          });
-
-          if (exitCode !== 0) {
-            process.stderr.write(`npm publish 以退出码 ${exitCode} 结束\n`);
-            if (!state.dryRun) {
-              const tail = captured.join('').slice(-4096);
-              const parsedTail = parseNpmAuthOutput(tail);
-              try {
-                await deliver(
-                  buildPayload({
-                    phase: 'failed',
-                    core: state,
-                    reason: `npm publish 退出码 ${exitCode}`,
-                    auth: parsedTail.url ? parsedTail : undefined,
-                    outputTail: tail,
-                  }),
-                );
-              } catch (error) {
-                process.stderr.write(`失败通知投递失败：${errorSummary(error)}\n`);
+            const announceAuth = async (parsed, reason) => {
+              if (notified.value) return;
+              notified.value = true;
+              if (state.dryRun) {
+                process.stdout.write('dry-run：检测到二次验证提示，未投递 webhook\n');
+                return;
               }
+              const payload = buildPayload({
+                phase: parsed.kind || 'npm-2fa',
+                core: state,
+                auth: { kind: parsed.kind || 'npm-2fa', url: parsed.url, code: parsed.code },
+                summary: `${reason}，请在 ${waitMinutes} 分钟内完成：${parsed.url || '见 workflow 日志中的原始输出'}`,
+              });
+              try {
+                await deliver(payload);
+                process.stdout.write(`已把验证网址转发到 webhook（title=${payload.title}）\n`);
+              } catch (error) {
+                process.stderr.write(`验证网址转发失败：${errorSummary(error)}\n`);
+              }
+            };
+
+            const args = ['publish', '--access', 'public', '--tag', state.distTag];
+            const otp = readOptional(process.env.INPUT_OTP);
+            if (otp) args.push('--otp', otp);
+            if (state.dryRun) args.push('--dry-run');
+            process.stdout.write(`运行：npm ${args.join(' ')}\n`);
+
+            const child = spawn('npm', args, {
+              env: { ...process.env, npm_config_git_checks: 'false' },
+              stdio: ['ignore', 'pipe', 'pipe'],
+            });
+
+            let announced = false;
+            const handleChunk = (chunk) => {
+              remember(chunk);
+              const parsed = parseNpmAuthOutput(captured.join('').slice(-65_536));
+              if (parsed.url && !announced) {
+                announced = true;
+                void announceAuth(parsed, 'npm 要求二次验证或登录');
+              }
+            };
+
+            for (const stream of ['stdout', 'stderr']) {
+              child[stream].setEncoding('utf8');
+              child[stream].on('data', (chunk) => {
+                process.stdout.write(chunk);
+                handleChunk(chunk);
+              });
             }
-            process.exit(1);
+
+            const exitCode = await new Promise((resolveCode) => {
+              child.on('error', (error) => {
+                process.stderr.write(`无法启动 npm：${error.message}\n`);
+                resolveCode(127);
+              });
+              child.on('close', (code) => resolveCode(code ?? 1));
+            });
+
+            if (exitCode !== 0) {
+              process.stderr.write(`npm publish 以退出码 ${exitCode} 结束\n`);
+              if (!state.dryRun) {
+                const tail = captured.join('').slice(-4096);
+                const parsedTail = parseNpmAuthOutput(tail);
+                try {
+                  await deliver(
+                    buildPayload({
+                      phase: 'failed',
+                      core: state,
+                      reason: `npm publish 退出码 ${exitCode}`,
+                      auth: parsedTail.url ? parsedTail : undefined,
+                      outputTail: tail,
+                    }),
+                  );
+                } catch (error) {
+                  process.stderr.write(`失败通知投递失败：${errorSummary(error)}\n`);
+                }
+              }
+              process.exit(1);
+            }
+
+            process.stdout.write(`npm publish 结束，退出码 0${state.dryRun ? '（dry-run，未写入 registry）' : ''}\n`);
+            if (process.env.GITHUB_OUTPUT) {
+              appendFileSync(process.env.GITHUB_OUTPUT, `published=${state.dryRun ? 'false' : 'true'}\n`);
+            }
           }
 
-          process.stdout.write(`npm publish 结束，退出码 0${state.dryRun ? '（dry-run，未写入 registry）' : ''}\n`);
-          if (process.env.GITHUB_OUTPUT) appendFileSync(process.env.GITHUB_OUTPUT, `published=${state.dryRun ? 'false' : 'true'}\n`);
-                  }
-
-                  if (IS_DIRECT) {
-          try {
-            await main();
-          } catch (error) {
-            process.stderr.write(`发布异常：${errorSummary(error)}\n`);
-            process.exit(1);
+          if (IS_DIRECT) {
+            try {
+              await main();
+            } catch (error) {
+              process.stderr.write(`发布异常：${errorSummary(error)}\n`);
+              process.exit(1);
+            }
           }
-                  }
-                  // <<< publish
+          // <<< publish
           PUBLISH_JS
           cd "$GITHUB_WORKSPACE${PKG_TARGET_DIR:+/$PKG_TARGET_DIR}"
           node "$stage/publish.mjs"
@@ -686,7 +686,6 @@ jobs:
           // <<< verification-parse
           VERIFICATION_PARSE_JS
           node --check "$stage/verification-parse.mjs"
-          echo "二次验证网址提取器已就绪"
 
       - name: Create Forgejo release
         if: env.FORGEJO_TOKEN != ''
