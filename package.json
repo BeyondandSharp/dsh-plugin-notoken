@@ -1,6 +1,6 @@
 {
   "name": "@beyondandsharp/dsh-plugin-notoken",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "description": "DSH host plugin: one stable login entry that exchanges the process launch token for the browser-session cookie, so a first visit needs no ?token=... in the URL. WARNING: this removes the authentication step.",
   "license": "MIT",
   "type": "module",
