@@ -36,6 +36,7 @@ cp -r npm-publish /path/to/target-repo/.forgejo
 │   └── npm-publish.yml            # 165 行，只有编排；唯一的 shell 是定位入口那 3 行
 └── scripts/                       # 全部逻辑，普通 .mjs 文件
     ├── run.mjs                    # 分发器：每个步骤一行调用它
+    ├── deps.mjs                   # 缺工具时用 apk/apt/yum 安装 + 代理映射
     ├── locate-action.mjs          # 找 Action 目录（github.action_path 为空的情况）
     ├── notify-lib.mjs             # webhook 载荷、投递、认证链接判定
     ├── verification-parse.mjs     # 从 npm 输出里提取授权链接与验证码
@@ -59,9 +60,10 @@ workflow 里每一步都长这样（`配置里没有内嵌脚本`）：
 唯一的例外是定位步骤本身 —— 它必须先找到 `run.mjs` 才能调用它，所以有 3 行引导（依次尝试
 `${{ github.action_path }}`、`$GITHUB_WORKSPACE/.forgejo`、在仓库内搜索 `*/scripts/run.mjs`）。
 
-可用子命令：`locate-action`、`verify-action`、`install-deps`、`resolve`、`preflight`、`test`、
-`build`、`prepare`、`publish`、`release`、`notify-failure`；都能在本地直接跑，例如
-`GITHUB_WORKSPACE=$PWD node scripts/run.mjs locate-action`。
+可用子命令：`locate-action`、`ensure-tools`、`verify-action`、`install-deps`、`resolve`、`preflight`、
+`test`、`build`、`prepare`、`publish`、`release`、`notify-failure`；都能在本地直接跑，例如
+`GITHUB_WORKSPACE=$PWD node scripts/run.mjs locate-action`、
+`APK_PROXY=http://proxy:8080 node scripts/run.mjs ensure-tools`。
 
 复制不全会被 `verify-action` 拦下并逐个列出缺哪个文件。
 
@@ -78,34 +80,44 @@ workflow 里每一步都长这样（`配置里没有内嵌脚本`）：
 | --- | --- |
 | `sh` | 工作流用 `shell: sh` 运行，**不依赖 bash**（Alpine、distroless 等都能跑） |
 | `node` | 镜像里要有 Node ≥ 18；`container.image` 默认 `node:22-bookworm` |
-| `script`（util-linux） | **只有走网页登录/二次验证时才需要**：npm 必须看到终端才会给出 `auth/cli/<uuid>` 链接 |
+| `script` | **可选**。npm ≥ 11.9.0 用管道就能拿到授权链接；只有更旧的 npm 才需要它（作为回退） |
 | `timeout` | 用于给登录/验证设定等待上限（busybox 自带） |
 
-**Alpine 用户**：
+**缺失的工具会自动安装**：`Ensure container tools` 步骤会探测 `git`/`script`/`timeout`，缺哪个就用镜像自带的包管理器（`apk` / `apt-get` / `yum` / `dnf` / `microdnf`）装，并通过下面的代理变量走网。用 `SKIP_TOOL_INSTALL=true` 可关闭（离线镜像已经预装工具时用）。非 root 且无 `sudo` 时会跳过安装并打印需要手动执行的命令。
+
+**Alpine 用户**：直接可用，不需要额外装包。
 
 ```yaml
     container:
       image: node:22-alpine
 ```
 
-```dockerfile
-# 若该镜像里没有 script(1)：
-apk add --no-cache util-linux
-```
+原因：`npm login` 在没有终端时也会打印登录网址；`npm publish` 需要二次验证时会以 EOTP 报错并在其中带上 `authUrl`/`doneUrl`（npm ≥ 11.9.0）。脚本从这些输出里取链接，并轮询 `doneUrl` 换到一次性 token，再用 `--otp` 重试 —— 全程不用终端，因此也不需要 `script(1)`。
 
 跑到 `Verify action scripts` 步骤时日志会打印能力探测结果：
 
 ```
-运行环境：sh=ok script(PTY)=ok timeout=ok
+运行环境：sh=ok script(PTY)=缺失 timeout=ok
 ```
 
-如果显示 `script(PTY)=缺失`，`publish` 阶段需要交互式认证时会**立即失败并给出修复指引**（不会静默发不出去）。想先确认，可以在仓库里跑一次：
+`script(PTY)=缺失` 在 npm ≥ 11.9.0 时**不影响发布**；只有当镜像里的 npm 更旧、且需要网页登录/二次验证时，`ensure-tools` 才会去装 `util-linux`（提供 `script`）作为回退。
 
-```bash
-docker run --rm node:22-alpine sh -c 'command -v script || echo "缺 script：需要 apk add util-linux"'
-```
+### 代理（无直连出网时）
 
-> 如果发布**不需要**交互式认证（例如账号配了 npm trusted publishing / OIDC），即使没有 `script` 也能正常发布。
+runner 没有直连外网时，把下列仓库变量填上；它们会同时用于**包管理器安装**、`npm`、`git`：
+
+| 变量 | 作用 |
+| --- | --- |
+| `ALL_PROXY` | 通用兜底（`socks5://…` 也可以） |
+| `HTTP_PROXY` / `HTTPS_PROXY` | 标准 HTTP 代理 |
+| `NO_PROXY` | 不走代理的地址（如 `localhost,.internal`） |
+| `APT_PROXY` | apt 专用，**优先于**上面的通用变量（apt 不支持 socks5，就需要它单独指 HTTP 代理） |
+| `APK_PROXY` | apk 专用，同上 |
+| `YUM_PROXY` | yum/dnf 专用，同上 |
+| `GO_PROXY` | Go 模块代理 |
+| `NPM_CONFIG_PROXY` | 只影响 npm |
+
+取值优先级（以 apt 为例）：`APT_PROXY` → `HTTP_PROXY`/`HTTPS_PROXY` → `ALL_PROXY`。变量会同时以大写和小写形式导出（`http_proxy`/`HTTP_PROXY`），因为不同工具认不同写法；`NO_PROXY` 也一样。
 
 ### runner 标签与镜像（重要）
 
@@ -222,7 +234,16 @@ dist-tag 默认：正式版 `latest`，含 `-` 的预发布版 `next`；可用�
 | 需要登录 | `npm-login-required` | `npm login --auth-type=web` 打印的 `auth/cli/<uuid>` |
 | 需要二次验证 | `npm-2fa` | `npm publish` 打印的第二个 `auth/cli/<uuid>` |
 
-关键点：**每次 npm 调用都在伪终端（`script(1)`）里运行**。没有 TTY 时 npm 根本不会进入网页验证流程，只会打印 `E401` —— 这也是之前拿不到 `auth/cli` 网址的原因。转发后 npm 进程原地轮询，你在浏览器点完授权它就自己继续，不需要你回传任何东西。
+关键点：**不需要伪终端**。npm 在无终端时同样会暴露授权链接：
+
+| 场景 | 脚本从哪里拿到网址 | 拿到之后 |
+| --- | --- | --- |
+| 未登录 | `npm login --auth-type=web` 直接打印 `Log in on <url>` | 转发；npm 自己轮询，脚本同时可轮询 `doneUrl` |
+| 需要二次验证 | `npm publish --json` 失败，错误 JSON 里的 `error.authUrl` / `error.doneUrl` | 转发 `authUrl`，轮询 `doneUrl`（202 继续等 / 200 返回 `{token}`），再用 `--otp=<token>` 重试 |
+
+解析要点：npm 的报错 JSON 每一行都带 `npm error ` 前缀，脚本会先剥掉前缀再按 `{`…`}` 解析。
+
+只有 **npm < 11.9.0** 才需要回退到 `script(1)` 伪终端（此时 `NPM_FORCE_PTY=true` 可强制启用）。脚本会先探测 npm 版本再决定。
 
 **不同网址都会推送**（登录一条、二次验证一条）；**完全相同的网址只推一次**。
 
@@ -331,7 +352,7 @@ node -e "import('/absolute/path/to/.forgejo/scripts/notify-lib.mjs').then((lib) 
 
 ## 测试
 
-本目录的代码在源仓库 `test/` 下有完整测试（96 个用例，直接 import 这里发布的同一批 `.mjs` 文件，另有把整目录复制成 `.forgejo` 后按真实步骤跑通的端到端用例）：
+本目录的代码在源仓库 `test/` 下有完整测试（131 个用例，直接 import 这里发布的同一批 `.mjs` 文件，另有把整目录复制成 `.forgejo` 后按真实步骤跑通的端到端用例）：
 
 ```bash
 node --test test/*.test.mjs                 # 运行全部测试

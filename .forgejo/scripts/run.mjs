@@ -22,6 +22,17 @@ import { spawn } from 'node:child_process';
 import { existsSync, readFileSync, realpathSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import {
+  canInstall,
+  commandPrefix,
+  detectPackageManager,
+  installCommand,
+  installTools,
+  missingTools,
+  packagesFor,
+  proxyEnv,
+  REQUIRED_TOOLS,
+} from './deps.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -52,6 +63,8 @@ const PROGRAMS = {
 export const REQUIRED_SCRIPTS = [
   'notify-lib.mjs',
   'verification-parse.mjs',
+  'npm-auth.mjs',
+  'deps.mjs',
   'locate-action.mjs',
   'run.mjs',
   'resolve.mjs',
@@ -64,6 +77,7 @@ export const REQUIRED_SCRIPTS = [
 
 export const SUBCOMMANDS = [
   'locate-action',
+  'ensure-tools',
   'verify-action',
   'install-deps',
   'resolve',
@@ -134,11 +148,12 @@ async function runSubprocessProgram(name, env) {
 }
 
 /**
- * Container capabilities. The programs need Node (a given) and, for npm's web
- * authorisation, `script(1)` from util-linux: Debian/Ubuntu images ship it,
- * Alpine's BusyBox does not (there it needs `apk add util-linux`). Reporting the
- * gap here turns a confusing failure at publish time into an early, actionable
- * one. Alpine is otherwise fine: the workflow runs `sh`, not `bash`.
+ * Container capabilities.
+ *
+ * `script(1)` (util-linux / bsdutils) is optional: npm >= 11.9.0 exposes the
+ * web-authorisation URLs to a plain pipe, so a PTY is only a fallback for older
+ * npm builds. The probe still reports it, because on an old npm that is the
+ * difference between a working release and a confusing failure.
  */
 export function probeEnvironment(run) {
   const has = (binary) =>
@@ -165,17 +180,75 @@ async function verifyAction(env) {
 
   const { spawnSync } = await import('node:child_process');
   const capabilities = probeEnvironment(spawnSync);
+  const missingToolsNow = missingTools(REQUIRED_TOOLS, spawnSync);
   process.stdout.write(
     `运行环境：sh=${capabilities.shell ? 'ok' : '缺失'} script(PTY)=${capabilities.pty ? 'ok' : '缺失'} timeout=${capabilities.timeout ? 'ok' : '缺失'}\n`,
   );
+  if (missingToolsNow.length > 0) {
+    process.stdout.write(`缺少工具：${missingToolsNow.join(', ')}\n`);
+  }
   if (!capabilities.pty) {
     process.stdout.write(
-      '提示：没有 script(1) 时 npm 无法进入网页登录/二次验证流程（不会得到 auth/cli 链接）。\n' +
-        '  Alpine: apk add --no-cache util-linux\n' +
-        '  Debian 系镜像自带；也可用 container.image: node:22-bookworm。\n',
+      '提示：没有 script(1)。npm >= 11.9.0 不需要它（管道即可拿到授权链接）；\n' +
+        '  仅当 npm 更旧、且需要网页登录/二次验证时才会用到，ensure-tools 会尝试自动安装。\n',
     );
   }
   return 0;
+}
+
+/**
+ * Install the container tools the release needs, with the image's own package
+ * manager and through the configured proxy.
+ *
+ * Set SKIP_TOOL_INSTALL=true to opt out (air-gapped images that prepackage the
+ * tools). Failure is a warning, not an error: images that already have the tools
+ * never reach the install path, and the publish step reports the real problem if
+ * a tool is genuinely missing.
+ */
+async function ensureTools(env) {
+  const { spawnSync } = await import('node:child_process');
+  const missing = missingTools(REQUIRED_TOOLS, spawnSync);
+  if (missing.length === 0) {
+    process.stdout.write(`工具齐全（${REQUIRED_TOOLS.join(', ')}），无需安装\n`);
+    return 0;
+  }
+  process.stdout.write(`缺少工具：${missing.join(', ')}\n`);
+
+  const manager = detectPackageManager(env, spawnSync);
+  if (!manager) {
+    process.stderr.write('没有可用的包管理器（apk/apt-get/yum），请改用自带这些工具的镜像\n');
+    return 0;
+  }
+  const packages = packagesFor(manager, missing);
+  const proxy = proxyEnv(manager, env);
+  const proxyNote = Object.keys(proxy).length > 0 ? `（代理：${Object.keys(proxy).join(', ')}）` : '（未配置代理）';
+  process.stdout.write(`使用 ${manager} 安装：${packages.join(', ')} ${proxyNote}\n`);
+
+  if (!canInstall(env)) {
+    process.stderr.write(`不是 root 且没有 sudo，跳过安装；请手动执行：${installHint(manager, packages)}\n`);
+    return 0;
+  }
+
+  const result = installTools({ manager, tools: missing, env });
+  const still = missingTools(REQUIRED_TOOLS, spawnSync);
+  if (still.length === 0) {
+    process.stdout.write(`已安装 ${result.installed.join(', ')}，工具齐全\n`);
+    return 0;
+  }
+  process.stderr.write(`仍缺少：${still.join(', ')}\n`);
+  process.stderr.write(`请手动执行：${installHint(manager, packages)}\n`);
+  return 0;
+
+  process.stderr.write(`自动安装失败（尝试过：${result.attempts.join(' | ') || '无'}）\n`);
+  process.stderr.write(`请手动执行：${installHint(manager, packages)}\n`);
+  return 0;
+}
+
+/** The command a human would run, for log messages. */
+export function installHint(manager, packages) {
+  const built = installCommand(manager, packages);
+  if (!built) return `用 ${manager} 安装 ${packages.join(' ')}`;
+  return [...commandPrefix(), built[0], ...built[1]].join(' ');
 }
 
 async function installDeps(env) {
@@ -218,6 +291,8 @@ export async function dispatch(name, env = process.env) {
     return 2;
   }
   switch (name) {
+    case 'ensure-tools':
+      return ensureTools(env);
     case 'verify-action':
       return verifyAction(env);
     case 'install-deps':

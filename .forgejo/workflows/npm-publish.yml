@@ -27,6 +27,9 @@
 # deliberately not shipped with the Action, so each repository supplies its own.
 # Optional NPM_PUBLISH_RUNNER_LABEL (default `docker`) and NPM_PUBLISH_IMAGE
 # (default `node:22-bookworm`) retarget the runner label and the job image.
+# Missing container tools (script/timeout/git) are installed with the image's
+# package manager through ALL_PROXY / APT_PROXY / APK_PROXY / YUM_PROXY;
+# SKIP_TOOL_INSTALL=true disables that.
 # Other optional variables: NOTIFY_REQUIRED, NOTIFY_TITLE_REPO_ONLY,
 # REQUIRED_ARTIFACTS, PKG_TARGET_DIR, SKIP_TEST, SKIP_BUILD, RELEASE_DIST_TAG,
 # NPM_OTP_WAIT_MINUTES.
@@ -95,6 +98,17 @@ jobs:
       INPUT_DRY_RUN: ${{ inputs.dry_run }}
       MESSAGE_PUSHER_TOKEN: ${{ secrets.MESSAGE_PUSHER_TOKEN }}
       FORGEJO_TOKEN: ${{ secrets.FORGEJO_TOKEN }}
+      # Proxies: passed through for the package managers (ensure-tools), npm and
+      # git. Set them as repository variables when the runner has no direct egress.
+      ALL_PROXY: ${{ vars.ALL_PROXY }}
+      HTTP_PROXY: ${{ vars.HTTP_PROXY }}
+      HTTPS_PROXY: ${{ vars.HTTPS_PROXY }}
+      NO_PROXY: ${{ vars.NO_PROXY }}
+      APT_PROXY: ${{ vars.APT_PROXY }}
+      APK_PROXY: ${{ vars.APK_PROXY }}
+      YUM_PROXY: ${{ vars.YUM_PROXY }}
+      GO_PROXY: ${{ vars.GO_PROXY }}
+      NPM_CONFIG_PROXY: ${{ vars.NPM_CONFIG_PROXY }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -117,6 +131,14 @@ jobs:
           [ -f "$dir/scripts/run.mjs" ] || dir="$GITHUB_WORKSPACE/.forgejo"
           [ -f "$dir/scripts/run.mjs" ] || dir="$(dirname "$(dirname "$(find "$GITHUB_WORKSPACE" -maxdepth 6 -name run.mjs -path '*/scripts/*' -print -quit)")")"
           node "$dir/scripts/run.mjs" locate-action
+
+      # Install missing container tools (script/timeout/git) with the image's own
+      # package manager, through the configured proxy. Skipped automatically when
+      # everything is present; SKIP_TOOL_INSTALL=true opts out.
+      - name: Ensure container tools
+        run: |
+          dir="${{ steps.locate.outputs.forgejo_dir }}"
+          node "$dir/scripts/run.mjs" ensure-tools
 
       - name: Verify action scripts
         run: |
