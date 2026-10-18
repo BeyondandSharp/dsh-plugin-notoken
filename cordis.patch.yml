@@ -14,14 +14,21 @@
       name: '@beyondandsharp/dsh-plugin-notoken'
       config:
         # Installed-application launches are what makes this necessary: an
-        # Android PWA/WebAPK (home-screen icon) or any external-app launch is
-        # labelled `Sec-Fetch-Site: cross-site` by Chrome, so the strict fence
-        # answers 403 to the icon while the same URL in a tab works. With this
-        # on, the entry allows a browser-labelled cross-site request only after
+        # Android PWA/WebAPK (home-screen icon) launched from Chrome is
+        # labelled `Sec-Fetch-Site: cross-site`, so the strict fence answers
+        # 403 to the icon while the same URL in a tab works. With this on, the
+        # entry allows a browser-labelled cross-site request only after
         # re-asking the same fence without those labels (the authority must
         # still be loopback/trustedHosts), and the session cookie is
         # SameSite=Strict, so no cross-site page can ever use it. Set it to
         # `false` for the strict behaviour (bookmarks and typed URLs only).
+        #
+        # Firefox for Android's "Add to Home Screen" is a different shape: it
+        # loads the shortcut as an external app and labels the navigation
+        # `Sec-Fetch-Site: none`, which the fence already admits — but Firefox
+        # still treats that launch as a foreign request for SameSite, so the
+        # Strict cookie never comes back. No flag is needed for it: the entry
+        # serves the shell in place for any session-less document navigation.
         allowCrossSiteNavigation: true
         # Remaining options are optional; unknown keys fail the plugin load.
         #   path: /__dsh_login   # one path segment, no trailing slash

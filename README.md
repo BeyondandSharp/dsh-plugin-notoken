@@ -18,10 +18,25 @@ GET /__dsh_login
   ├─ connection.requestRejection()  先过信任围栏：403 拒绝；401（还没有会话）放行
   ├─ connection.authenticatedUrl()  取当前进程 token（每次请求都取，重启后仍有效）
   ├─ connection.authorizeIndex()    进程内完成 token → cookie 交换（303 + Set-Cookie）
-  └─ 普通导航：把 303 转发给浏览器
-     跨站导航（点链接、主屏幕图标启动）：直接返回应用外壳，cookie 一起下发
-     （那条链上 SameSite=Strict 的 cookie 会被一直扣住，走 303 会变成"重定向次数过多"）
+  └─ 普通导航：
+      已带会话：303 转发给浏览器，地址栏落到 ./
+      没有会话：
+        · 标签 cross-site（Chrome 装应用启动，需 allowCrossSiteNavigation 放行）
+          或 none（Firefox 主屏、地址栏/书签等浏览器发起的导航）
+          → 直接返回应用外壳，cookie 一起下发，不再重定向
+        · 标签 same-origin / same-site → 仍 303（这类链会带上 Strict cookie，不会循环）
+      直连入口的 none 导航地址栏停在入口路径；经 nginx 内部改写的部署地址栏仍是 /
+      外壳由本进程拨自己监听的真实绑定地址（webServer.host:port）取回，
+      不是 127.0.0.1：`dsh web --host <地址>` 只监听那一个接口，回环可能 ECONNREFUSED。
 ```
+
+浏览器启动链上 `SameSite=Strict` 的 cookie 会被一直扣住，走 303 会变成"重定向次数过多"；
+所以入口对"没有会话、且标签为 cross-site（放行时）或 none 的文档导航"直接在同一次响应里
+返回外壳；已认证的导航、以及 same-origin/same-site 的导航仍然走 303，地址栏落到干净的 `./`。
+外壳回源必须拨 listen 的真实绑定地址（`webServer.getOrigin()` 只用于启动公告）：Firefox 的
+`Sec-Fetch-Site` 与 cookie 判定是两套逻辑，标签为 `none` 时同样可能带不上 cookie。
+`mode: redirect` 在 exchange 之前 302 到带 token 的 URL，那条链上主屏启动仍可能被扣住而
+循环 —— 它是兼容回退，不覆盖主屏启动；完全不发 `Sec-Fetch-*` 的老客户端仍走 303。
 
 不签 cookie、不接触密钥、不解析启动输出、不改 DSH 源码。
 

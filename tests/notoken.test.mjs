@@ -7,7 +7,7 @@ import { apply, inject, internals, name } from '../notoken.js'
 const COOKIE = 'dsh-auth-abc=v1.eyJhIjoxfQ.sig; Max-Age=2592000; Path=/; HttpOnly; SameSite=Strict'
 
 /** Minimal cordis-like context: route registry, effect runner, and a scripted connection. */
-function fakeContext({ rejection = 401, authorize } = {}) {
+function fakeContext({ rejection = 401, authorize, listener = {} } = {}) {
   const routes = []
   const disposers = []
   const calls = { requestRejection: [], authorizeIndex: [], authenticatedUrl: [] }
@@ -33,18 +33,24 @@ function fakeContext({ rejection = 401, authorize } = {}) {
       return false
     },
   }
+  const webServer = {
+    port: listener.port ?? 3199,
+    host: listener.host ?? '127.0.0.1',
+    protocol: listener.protocol ?? 'http:',
+    getOrigin() {
+      return `${this.protocol}//${this.host}:${String(this.port)}`
+    },
+    register(route) {
+      routes.push(route)
+      return () => {
+        const at = routes.indexOf(route)
+        if (at !== -1) routes.splice(at, 1)
+      }
+    },
+  }
   const ctx = {
     connection,
-    webServer: {
-      port: 3199,
-      register(route) {
-        routes.push(route)
-        return () => {
-          const at = routes.indexOf(route)
-          if (at !== -1) routes.splice(at, 1)
-        }
-      },
-    },
+    webServer,
     effect(factory) {
       const dispose = factory()
       disposers.push(dispose)
@@ -89,22 +95,27 @@ async function captureConsoleAsync(run) {
 }
 
 /** Load the plugin with a scripted context, capturing the announcement line. */
-function boot(options = {}, config = undefined) {
-  const fake = fakeContext(options)
+function boot(options = {}, config = undefined, listener = {}) {
+  const fake = fakeContext({ ...options, listener })
   const { logged } = captureConsole(() => { apply(fake.ctx, config) })
   return { ...fake, logged }
 }
 
-/** Replace the loopback document reader for one step; returns the calls it saw. */
+/** Replace the local document reader for one step; returns the calls it saw. */
 function stubDocument(respond) {
   const requests = []
   const original = internals.readDocument
-  internals.readDocument = async (port, host, cookie) => {
-    requests.push({ port, host, cookie })
-    return respond(port, host, cookie)
+  internals.readDocument = async (target, host, cookie) => {
+    requests.push({ target, host, cookie })
+    return respond(target, host, cookie)
   }
   return { requests, restore: () => { internals.readDocument = original } }
 }
+
+const SHELL = '<!doctype html><html><body><div id="root"></div></body></html>'
+
+/** The value {@link stubDocument} records for the default fake listener. */
+const LOCAL_TARGET = { protocol: 'http:', host: '127.0.0.1', port: 3199 }
 
 function fakeRequest({ method = 'GET', host = '127.0.0.1:3199', headers = {} } = {}) {
   return { method, headers: { host, ...headers } }
@@ -142,6 +153,14 @@ test('registers one exact route at the default path, announces it, and disposes 
   )
   disposers[0]()
   assert.equal(routes.length, 0)
+})
+
+test('announces the listener origin, including a non-loopback bind', () => {
+  const { logged } = boot({}, undefined, { host: '192.168.100.26', port: 3081 })
+  assert.match(
+    logged[0],
+    /^notoken-login: login entry at http:\/\/192\.168\.100\.26:3081\/__dsh_login \(no \?token= needed\)$/,
+  )
 })
 
 test('exchange mode relays the 303 and its cookie without leaking the token', () => {
@@ -209,7 +228,7 @@ test('a cross-site document navigation serves the shell in place of a redirect',
   const { requests, restore } = stubDocument(() => ({
     status: 200,
     contentType: 'text/html; charset=utf-8',
-    body: Buffer.from('<!doctype html><html><body><div id="root"></div></body></html>'),
+    body: Buffer.from(SHELL),
   }))
   try {
     await routes[0].handler(fakeRequest({
@@ -223,13 +242,110 @@ test('a cross-site document navigation serves the shell in place of a redirect',
   assert.equal(res.state.headers['set-cookie'], COOKIE)
   assert.match(String(res.state.body), /id="root"/)
   assert.deepEqual(requests, [{
-    port: 3199,
+    target: LOCAL_TARGET,
     host: '127.0.0.1:3199',
     cookie: 'dsh-auth-abc=v1.eyJhIjoxfQ.sig',
   }])
 })
 
-test('a failed loopback document fetch is a 502, never a redirect loop', async () => {
+test('a Firefox add-to-home-screen navigation (Sec-Fetch-Site: none, no cookie) serves the shell in place', async () => {
+  // Firefox launches an installed shortcut with LOAD_FLAGS_FROM_EXTERNAL: the
+  // request is labelled `none`, yet the external launch counts as a foreign
+  // request for SameSite, so the Strict cookie never comes back on the
+  // redirect chain. The entry must serve the shell for this first response.
+  const { routes, calls } = boot({ rejection: 401 })
+  const res = fakeResponse()
+  const { requests, restore } = stubDocument(() => ({
+    status: 200,
+    contentType: 'text/html; charset=utf-8',
+    body: Buffer.from(SHELL),
+  }))
+  try {
+    await routes[0].handler(fakeRequest({
+      headers: {
+        'sec-fetch-site': 'none',
+        'sec-fetch-mode': 'navigate',
+        'sec-fetch-dest': 'document',
+        'sec-fetch-user': '?1',
+      },
+    }), res)
+  } finally {
+    restore()
+  }
+  assert.equal(res.state.status, 200)
+  assert.equal(res.state.headers['cache-control'], 'no-store')
+  assert.equal(res.state.headers['set-cookie'], COOKIE)
+  assert.match(String(res.state.body), /id="root"/)
+  assert.equal(calls.authorizeIndex.length, 1)
+  assert.deepEqual(requests, [{
+    target: LOCAL_TARGET,
+    host: '127.0.0.1:3199',
+    cookie: 'dsh-auth-abc=v1.eyJhIjoxfQ.sig',
+  }])
+})
+
+test('the in-place document request dials the listener bind address, not loopback', async () => {
+  const { routes } = boot({ rejection: 401 }, undefined, { host: '192.168.100.26', port: 3081 })
+  const res = fakeResponse()
+  const { requests, restore } = stubDocument(() => ({
+    status: 200,
+    contentType: 'text/html; charset=utf-8',
+    body: Buffer.from(SHELL),
+  }))
+  try {
+    await routes[0].handler(fakeRequest({
+      host: 'dsh.example.com',
+      headers: { 'sec-fetch-site': 'none', 'sec-fetch-mode': 'navigate' },
+    }), res)
+  } finally {
+    restore()
+  }
+  assert.equal(res.state.status, 200)
+  assert.deepEqual(requests, [{
+    target: { protocol: 'http:', host: '192.168.100.26', port: 3081 },
+    host: 'dsh.example.com',
+    cookie: 'dsh-auth-abc=v1.eyJhIjoxfQ.sig',
+  }])
+})
+
+test('a native-TLS listener is dialled over https', () => {
+  assert.deepEqual(
+    internals.listenerTarget({ host: '10.0.0.5', port: 8443, protocol: 'https:' }),
+    { protocol: 'https:', host: '10.0.0.5', port: 8443 },
+  )
+  assert.throws(
+    () => internals.listenerTarget({ host: '', port: 3081, protocol: 'http:' }),
+    /no bound host and port/,
+  )
+  assert.throws(
+    () => internals.listenerTarget({ host: '127.0.0.1', port: undefined, protocol: 'http:' }),
+    /no bound host and port/,
+  )
+})
+
+test('a `none`-labelled subresource keeps the redirect', async () => {
+  const { routes } = boot({ rejection: 401 })
+  const res = fakeResponse()
+  routes[0].handler(fakeRequest({
+    headers: { 'sec-fetch-site': 'none', 'sec-fetch-mode': 'cors', 'sec-fetch-dest': 'empty' },
+  }), res)
+  await Promise.resolve()
+  assert.equal(res.state.status, 303)
+  assert.equal(res.state.headers['location'], './')
+})
+
+test('an already-authenticated `none` navigation keeps the clean-URL redirect', async () => {
+  const { routes } = boot({ rejection: () => undefined })
+  const res = fakeResponse()
+  routes[0].handler(fakeRequest({
+    headers: { 'sec-fetch-site': 'none', 'sec-fetch-mode': 'navigate', 'sec-fetch-dest': 'document' },
+  }), res)
+  await Promise.resolve()
+  assert.equal(res.state.status, 303)
+  assert.equal(res.state.headers['location'], './')
+})
+
+test('a failed local document fetch is a 502, never a redirect loop', async () => {
   const fence = req => (req.headers['sec-fetch-site'] === 'cross-site' ? 403 : 401)
   const { routes } = boot({ rejection: fence }, { allowCrossSiteNavigation: true })
   const res = fakeResponse()
@@ -244,10 +360,10 @@ test('a failed loopback document fetch is a 502, never a redirect loop', async (
     restore()
   }
   assert.equal(res.state.status, 502)
-  assert.match(res.state.body, /loopback/)
+  assert.match(res.state.body, /local listener/)
 })
 
-test('a loopback document request that is not 200 is a 502', async () => {
+test('a local document request that is not 200 is a 502', async () => {
   const fence = req => (req.headers['sec-fetch-site'] === 'cross-site' ? 403 : 401)
   const { routes } = boot({ rejection: fence }, { allowCrossSiteNavigation: true })
   const res = fakeResponse()

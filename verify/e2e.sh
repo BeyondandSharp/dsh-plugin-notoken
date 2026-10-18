@@ -59,21 +59,26 @@ status_of() {
   curl -s -o /dev/null -w '%{http_code}' "$@" 2>/dev/null || echo 000
 }
 
-# boot_instance <overlay-file> <port> <label>
+# boot_instance <overlay-file> <port> <label> [bind-host] [extra-cli-args]
 boot_instance() {
   INSTANCE_PORT="$2"
+  INSTANCE_HOST="${4:-127.0.0.1}"
+  INSTANCE_EXTRA="${5:-}"
   HOME_DIR="$PLUGIN_DIR/.verify-home-$3"
   LOG="$PLUGIN_DIR/.verify-home-$3.log"
   JAR="$HOME_DIR/cookies.txt"
-  BASE="http://127.0.0.1:$2"
+  BASE="http://$INSTANCE_HOST:$2"
   rm -rf "$HOME_DIR" "$LOG"
   mkdir -p "$HOME_DIR"
-  echo "booting throwaway instance '$3' on port $2 (DSH_HOME=$HOME_DIR)"
+  echo "booting throwaway instance '$3' on $INSTANCE_HOST:$2 (DSH_HOME=$HOME_DIR)"
   # A shipped profile name cannot be a --from-default-profile target, so each
   # throwaway profile is a distinct name composed from the shipped web template.
+  # INSTANCE_EXTRA is a deliberately word-split CLI argument list.
+  # shellcheck disable=SC2086
   setsid env DSH_HOME="$HOME_DIR" $CLI \
     --profile "notoken-verify-$3" --from-default-profile web \
-    --patch "$PLUGIN_DIR/verify/$1" --port "$2" --no-open >"$LOG" 2>&1 &
+    --patch "$PLUGIN_DIR/verify/$1" --host "$INSTANCE_HOST" --port "$2" --no-open \
+    $INSTANCE_EXTRA >"$LOG" 2>&1 &
   PID=$!
   for _ in $(seq 1 180); do
     grep -q '^dsh web: ' "$LOG" 2>/dev/null && break
@@ -117,6 +122,18 @@ check 'POST /__dsh_login -> 405' 405 "$(status_of -X POST "$BASE/__dsh_login")"
 # 6. the minted cookie stays bound to the authority it was minted for.
 check 'foreign loopback authority -> 401' 401 "$(status_of -b "$JAR" -H 'Host: 127.0.0.1:9999' "$BASE/")"
 
+# 7. a Firefox add-to-home-screen launch is labelled `none` (not cross-site) yet
+#    its Strict cookie is withheld, so the entry must serve the shell in this
+#    response; the strict configuration needs no cross-site opt-in for it.
+check 'Firefox A2HS shape -> 200 shell' 200 "$(status_of -H 'Sec-Fetch-Site: none' -H 'Sec-Fetch-Mode: navigate' -H 'Sec-Fetch-Dest: document' "$BASE/__dsh_login")"
+# Faithful end-to-end through the proxy shape: Firefox sends `none` and never
+# returns the Strict cookie, so a 303 chain would loop ("isn't redirecting").
+if node "$PLUGIN_DIR/verify/firefox-a2hs-flow.mjs" "$INSTANCE_PORT" >/dev/null 2>&1; then
+  check 'Firefox add-to-home-screen launch through a proxy completes' yes yes
+else
+  check 'Firefox add-to-home-screen launch through a proxy completes' yes no
+fi
+
 stop_instance
 
 # ── phase 2: allowCrossSiteNavigation ───────────────────────────────────────
@@ -141,6 +158,38 @@ if node "$PLUGIN_DIR/verify/webapk-flow.mjs" "$INSTANCE_PORT" >/dev/null 2>&1; t
 else
   check 'installed-app launch through a proxy completes' yes no
 fi
+
+stop_instance
+
+# ── phase 3: bind address is not 127.0.0.1 (Linux) ──────────────────────────
+# The in-place document request must dial the listener's own bind address.
+# 127.0.1.1 is a concrete Linux bind address in 127/8; DSH still classifies it
+# as loopback, but a hard-coded 127.0.0.1 dial is refused because the listener
+# owns only 127.0.1.1 — the `dsh web --host <address>` failure shape. (Binding
+# 127.0.1.1 works on Linux only; this phase is Linux-specific.) `--trusted-host`
+# adds the public authority the reverse proxy preserves, so the production
+# combination (public Host + bind-address dial) is covered too.
+boot_instance overlay.yml 3201 bound 127.0.1.1 '--trusted-host dsh.example.com'
+
+check 'entry on a 127.0.1.1 bind -> 303' 303 "$(status_of "$BASE/__dsh_login")"
+check 'Firefox A2HS on a 127.0.1.1 bind -> 200 shell' 200 "$(status_of -H 'Sec-Fetch-Site: none' -H 'Sec-Fetch-Mode: navigate' -H 'Sec-Fetch-Dest: document' "$BASE/__dsh_login")"
+if node "$PLUGIN_DIR/verify/firefox-a2hs-flow.mjs" "$INSTANCE_PORT" "$INSTANCE_HOST" >/dev/null 2>&1; then
+  check 'Firefox launch through a proxy completes on a 127.0.1.1 bind' yes yes
+else
+  check 'Firefox launch through a proxy completes on a 127.0.1.1 bind' yes no
+fi
+
+# The fronted shape: the proxy preserves a public Host while DSH listens on the
+# bind address only. The cookie authority is that public Host, and the in-place
+# document fetch must present it against the bind address.
+check 'public-Host entry on a 127.0.1.1 bind -> 303' 303 "$(status_of -H 'Host: dsh.example.com' "$BASE/__dsh_login")"
+if node "$PLUGIN_DIR/verify/firefox-a2hs-flow.mjs" "$INSTANCE_PORT" "$INSTANCE_HOST" dsh.example.com >/dev/null 2>&1; then
+  check 'Firefox launch under a preserved public Host completes' yes yes
+else
+  check 'Firefox launch under a preserved public Host completes' yes no
+fi
+
+stop_instance
 
 printf '\n%d checks, %d failures\n' "$CHECKS" "$FAILURES"
 if [ "$FAILURES" -ne 0 ]; then

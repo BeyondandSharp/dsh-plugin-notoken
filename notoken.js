@@ -19,7 +19,26 @@
  * capturing response, then relays the 303 plus its `Set-Cookie` header. The
  * browser therefore only ever sees `/__dsh_login` (and the redirect to `./`).
  * `redirect` mode is the compatible fallback: it answers 302 with the
- * token-bearing URL, which puts the token in the browser history.
+ * token-bearing URL, which puts the token in the browser history. It does not
+ * cover installed-app launches: their Strict cookie is withheld on that token
+ * URL chain too, so it can still loop.
+ *
+ * The session cookie is `SameSite=Strict`, and some launches withhold it for a
+ * whole redirect chain. Chrome labels an installed PWA/WebAPK launch
+ * `Sec-Fetch-Site: cross-site`; Firefox labels its add-to-home-screen launch
+ * `Sec-Fetch-Site: none` while still treating the external launch as a foreign
+ * request for SameSite purposes. A 303 back to `./` then bounces to a
+ * cookie-less `/` forever (observed as "too many redirects"). For a document
+ * navigation that reaches the entry without a session and is labelled
+ * `cross-site` (only when allowed) or `none` — the two shapes whose Strict
+ * cookie the chain will withhold — the entry serves the application shell in
+ * this same response instead: its root is fetched from the listener's own bind
+ * address (`webServer.host` and `port`) with the freshly minted cookie, so the
+ * bytes are exactly the render the redirect would serve and the browser keeps
+ * the URL it asked for. Same-origin/same-site navigations still take the 303:
+ * their redirect chain does carry the cookie. Dialing the bind address, never a
+ * hard-coded loopback, matters because `dsh web --host <address>` binds one
+ * concrete interface: `127.0.0.1` may refuse the connection.
  *
  * The token is read per request, so the entry never goes stale across
  * restarts. The cookie lifetime stays whatever `client-connection`'s
@@ -28,6 +47,7 @@
  */
 
 import { request as httpRequest } from 'node:http'
+import { request as httpsRequest } from 'node:https'
 
 /** Cordis function-plugin name. */
 export const name = 'notoken-login'
@@ -163,28 +183,68 @@ function captureResponse() {
   }
 }
 
-/** Deadline for the loopback document request that serves an application shell. */
+/** Deadline for the local document request that serves an application shell. */
 const DOCUMENT_TIMEOUT_MS = 5000
 
 /**
- * GET the application root over loopback with an explicit Host and the freshly
- * minted cookie. `node:http` is deliberate: the global `fetch` treats `Host` as
- * a forbidden header and silently sends the URL's own authority instead, which
- * would mint the cookie against one authority and present it as another.
- * @param port - the webserver's listening port.
+ * Where this process's own web server answers. `webServer.host` is the one
+ * concrete interface the listener bound (the web server rejects wildcard
+ * binds), so dialing it from this machine always reaches this same process.
+ * A deployment such as `dsh web --host 192.168.0.10` listens on that address
+ * only — `127.0.0.1` is refused, and hard-coding it is what made the in-place
+ * shell fail with ECONNREFUSED.
+ * @param webServer - the Host web-server service.
+ * @returns the protocol, bind host, and listening port of the local listener.
+ * @throws when the service has no bound address yet.
+ */
+function listenerTarget(webServer) {
+  const { host, port } = webServer
+  if (typeof host !== 'string' || host === '' || typeof port !== 'number') {
+    throw new Error('the web server has no bound host and port')
+  }
+  return { protocol: webServer.protocol === 'https:' ? 'https:' : 'http:', host, port }
+}
+
+/**
+ * A printable form of {@link listenerTarget} for the announcement line.
+ * @param webServer - the Host web-server service.
+ * @returns the local origin (for example `http://127.0.0.1:3080`).
+ */
+function listenerOrigin(webServer) {
+  try {
+    return webServer.getOrigin()
+  } catch {
+    const target = listenerTarget(webServer)
+    return `${target.protocol}//${target.host}:${String(target.port)}`
+  }
+}
+
+/**
+ * GET the application root from the composition's own listener with an explicit
+ * Host and the freshly minted cookie. `node:http` is deliberate: the global
+ * `fetch` treats `Host` as a forbidden header and silently sends the URL's own
+ * authority instead, which would mint the cookie against one authority and
+ * present it as another. The bind address, not `127.0.0.1`, is the target: the
+ * listener binds exactly one concrete interface, so a loopback dial can be
+ * refused.
+ * @param target - protocol, bind host, and listening port (see {@link listenerTarget}).
  * @param host - the caller's Host authority (the cookie is bound to it).
  * @param cookie - the minted cookie pair.
  * @returns the status, content type, and body bytes of the document response.
  */
-function readDocumentOverLoopback(port, host, cookie) {
+function readDocumentOverLocalListener(target, host, cookie) {
+  const transport = target.protocol === 'https:' ? httpsRequest : httpRequest
   return new Promise((resolve, reject) => {
-    const request = httpRequest({
-      host: '127.0.0.1',
-      port,
+    const request = transport({
+      host: target.host,
+      port: target.port,
       method: 'GET',
       path: '/',
       headers: { host, cookie, connection: 'close' },
       timeout: DOCUMENT_TIMEOUT_MS,
+      // A native-TLS listener's certificate may name its public authority
+      // rather than the bind address; this request never leaves the machine.
+      ...(target.protocol === 'https:' ? { rejectUnauthorized: false } : {}),
     }, (response) => {
       const chunks = []
       response.on('data', chunk => { chunks.push(chunk) })
@@ -199,15 +259,15 @@ function readDocumentOverLoopback(port, host, cookie) {
       })
     })
     request.on('timeout', () => {
-      request.destroy(new Error(`loopback document request timed out after ${String(DOCUMENT_TIMEOUT_MS)}ms`))
+      request.destroy(new Error(`local document request timed out after ${String(DOCUMENT_TIMEOUT_MS)}ms`))
     })
     request.on('error', reject)
     request.end()
   })
 }
 
-/** Test seam: the loopback document reader. */
-export const internals = { readDocument: readDocumentOverLoopback }
+/** Test seam: the local document reader and the bind-address derivation. */
+export const internals = { readDocument: readDocumentOverLocalListener, listenerTarget }
 
 /** Whether the caller is asking for a top-level document rather than an API-shaped
  * subresource. A client that sends no fetch metadata at all (curl, older
@@ -224,15 +284,17 @@ function navigatesDocument(req) {
 /**
  * Serve the application document in place of a redirect.
  *
- * A navigation chain that the browser labelled cross-site withholds
- * `SameSite=Strict` cookies from every hop, including the hop after a 303 — so
- * `303 location: ./` would bounce back to a cookie-less `/` forever (observed
- * as "too many redirects" when launching an installed PWA/WebAPK). This serves
- * the document for the request that is already in flight instead: the shell is
- * fetched from the composition's own `/` over loopback with the freshly minted
- * cookie, so it is exactly the render the fallback would serve, and the browser
- * keeps the URL it asked for. The cookie still rides along, which is what every
- * same-origin request the loaded application makes will use.
+ * A launch chain may withhold `SameSite=Strict` cookies from every hop,
+ * including the hop after a 303 — so `303 location: ./` would bounce back to a
+ * cookie-less `/` forever (observed as "too many redirects" when launching an
+ * installed PWA/WebAPK, and with Firefox's add-to-home-screen launch, which
+ * labels its request `Sec-Fetch-Site: none` but treats the external launch as
+ * foreign for SameSite). This serves the document for the request that is
+ * already in flight instead: the shell is fetched from the composition's own
+ * listener with the freshly minted cookie, so it is exactly the render the
+ * fallback would serve, and the browser keeps the URL it asked for. The cookie
+ * still rides along, which is what every same-origin request the loaded
+ * application makes will use.
  * @param ctx - Host plugin context carrying `webServer`.
  * @param res - the response to own.
  * @param host - the caller's Host authority (the internal request must carry it,
@@ -243,18 +305,19 @@ async function serveDocumentInPlace(ctx, res, host, setCookie) {
   const cookie = setCookie.split(';', 1)[0].trim()
   let document
   try {
-    document = await internals.readDocument(ctx.webServer.port, host, cookie)
+    document = await internals.readDocument(internals.listenerTarget(ctx.webServer), host, cookie)
   } catch (error) {
-    console.warn(`${name}: the loopback document request failed: ${String(error)}`)
-    refuse(res, 502, 'could not fetch the application document over loopback')
+    console.warn(`${name}: the local document request failed: ${String(error)}`)
+    refuse(res, 502, 'could not fetch the application document from the local listener')
     return
   }
   if (document.status !== 200) {
-    console.warn(`${name}: the loopback document request answered ${String(document.status)}`)
-    refuse(res, 502, `the loopback document request answered ${String(document.status)}`)
+    console.warn(`${name}: the local document request answered ${String(document.status)}`)
+    refuse(res, 502, `the local document request answered ${String(document.status)}`)
     return
   }
   res.writeHead(200, {
+    'cache-control': 'no-store',
     'content-type': document.contentType,
     'set-cookie': setCookie,
   })
@@ -274,11 +337,14 @@ export function apply(ctx, config) {
       refuse(res, 405, `only GET opens the login entry (got ${req.method})`, { allow: 'GET' })
       return
     }
-    // 403 = the fence refused this authority/marker; 401 = no browser session
-    // yet, which is the entry's own reason to exist. The refusal names its
-    // facts: an empty 403 is the least debuggable response a deployment can get.
+    // 403 = the fence refused this authority/marker; 401 = the authority passed
+    // the fence but there is no usable browser session, which is the entry's
+    // own reason to exist. The refusal names its facts: an empty 403 is the
+    // least debuggable response a deployment can get.
     let allowedByLabelsOnly = false
-    if (ctx.connection.requestRejection(req) === 403) {
+    let sessionMissing = false
+    const rejection = ctx.connection.requestRejection(req)
+    if (rejection === 403) {
       const facts = fenceFacts(req)
       if (allowCrossSiteNavigation && authorityPassesWithoutLabels(ctx, req)) {
         // The authority is ours; only the browser's cross-site label refused it.
@@ -293,6 +359,8 @@ export function apply(ctx, config) {
           + `trustedHosts, and scripted cross-site requests or foreign Origins are refused (${facts})`)
         return
       }
+    } else if (rejection === 401) {
+      sessionMissing = true
     }
     const host = req.headers.host
     if (typeof host !== 'string' || host === '') {
@@ -319,12 +387,19 @@ export function apply(ctx, config) {
       sendRedirect(res, authenticated.href)
       return
     }
-    // A chain the browser labelled cross-site withholds SameSite=Strict cookies
-    // from every hop, so redirecting back to './' would loop forever. Serve the
-    // document for the request already in flight instead (see
-    // serveDocumentInPlace). Reverse proxies that internally rewrite `/` to
-    // this route therefore return the shell under the browser's own URL.
-    if (allowedByLabelsOnly && navigatesDocument(req)) {
+    // A launch chain may withhold the new SameSite=Strict cookie from every
+    // hop, so redirecting back to './' would loop forever. Two browser shapes
+    // reach here without a session: a chain labelled cross-site (Chrome
+    // installed PWA/WebAPK; relaxation gated by allowCrossSiteNavigation), and
+    // a user/browser-initiated navigation labelled `none` (Firefox
+    // add-to-home-screen). Serve the document for the request already in
+    // flight instead (see serveDocumentInPlace). Reverse proxies that
+    // internally rewrite `/` to this route therefore return the shell under the
+    // browser's own URL.
+    const secFetchSite = headerLine(req, 'sec-fetch-site')
+    const launchWithoutSession = allowedByLabelsOnly
+      || (sessionMissing && secFetchSite === 'none')
+    if (launchWithoutSession && navigatesDocument(req)) {
       await serveDocumentInPlace(ctx, res, host, headers['set-cookie'])
       return
     }
@@ -339,9 +414,9 @@ export function apply(ctx, config) {
 
   // Announce the entry beside the `dsh web:` URL line: this composition's
   // logger exporter is not wired to stdout, and the URL line itself uses
-  // console.log for exactly that reason.
-  const port = ctx.webServer.port
-  if (typeof port === 'number') {
-    console.log(`${name}: login entry at http://127.0.0.1:${String(port)}${path} (no ?token= needed)`)
+  // console.log for exactly that reason. The origin is the listener's real bind
+  // address, not loopback: `--host` deployments do not answer on 127.0.0.1.
+  if (typeof ctx.webServer.port === 'number') {
+    console.log(`${name}: login entry at ${listenerOrigin(ctx.webServer)}${path} (no ?token= needed)`)
   }
 }
