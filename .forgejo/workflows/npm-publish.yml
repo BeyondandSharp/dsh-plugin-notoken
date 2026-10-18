@@ -1,38 +1,56 @@
 # npm-publish — tag-triggered npm release with webhook relay for verification URLs.
 #
 # The programs live as real files in <action>/scripts/*.mjs and are executed with
-# `node "$forgejo_dir/scripts/<name>.mjs"`; this file only orchestrates them.
+# `node "$FORGEJO_DIR/scripts/run.mjs" <subcommand>`; this file only orchestrates
+# them. `Locate action directory` finds the copied .forgejo directory and exports
+# FORGEJO_DIR (and the forgejo_dir step output) for every step below.
 #
 # Usage: copy this npm-publish/ directory into a target repository, rename it to
 # .forgejo, and the workflow runs there. It only reads the target repository's
 # package.json, lock file, build outputs and git history.
 #
-# Flow: tag push -> version check -> tests -> build -> pack check -> npm publish
-# -> Forgejo release. There is no approval prompt. When npm demands a login or a
-# second factor, the verification URL (and code) npm prints is forwarded to the
-# configured webhook as POST application/json, while npm itself keeps polling
-# until the human finishes in the browser.
+# Flow: tag push -> locate -> ensure tools -> verify -> install deps -> resolve
+# -> preflight (idempotency + version + tag) -> test -> build -> prepare
+# (artifact check + pack + sha256) -> npm publish -> Forgejo release.
+# There is no approval prompt.
 #
-# Repository secrets: MESSAGE_PUSHER_TOKEN (optional), FORGEJO_TOKEN (optional;
-# without it the Forgejo release step is skipped). No npm token is used:
-# authentication is npm's own web flow, relayed to a human:
-#   1. not logged in -> `npm login --auth-type=web` prints an auth/cli/<uuid> URL,
-#      which is forwarded; npm keeps polling until the browser login completes;
-#   2. then `npm publish` runs; when a second factor is due npm prints a second
-#      auth/cli/<uuid> URL, forwarded the same way, and finishes once confirmed.
-# Every npm invocation runs under a TTY (script(1)) because without one npm
-# refuses the interactive flow and only prints E401. NPM_AUTH_WAIT_MINUTES bounds
-# each wait.
+# Authentication is npm's own web flow, relayed to a human — no registry token:
+#   1. not logged in -> `npm login --auth-type=web` prints a one-time login URL,
+#      which is POSTed to the configured webhook; npm keeps polling doneUrl until
+#      the browser flow finishes;
+#   2. `npm publish` then runs; when a second factor is due npm raises EOTP with
+#      authUrl/doneUrl, prints the authUrl, polls doneUrl and retries the publish
+#      with the one-time token itself.
+# Both npm branches only run when stdin AND stdout are TTYs, so the calls go
+# through script(1) (installed by ensure-tools when missing); without a PTY npm
+# rethrows a bare EOTP and no link can be relayed.
+# Repository variable NPM_AUTH_WAIT_MINUTES (default 15) is the TOTAL budget for
+# the whole interaction, so the job cannot overshoot its own timeout.
+# Even without a terminal the release is finishable: pass the one-time code in
+# the workflow_dispatch `otp` input.
+#
+# Repository secrets: MESSAGE_PUSHER_TOKEN (optional, on the publish step only),
+# FORGEJO_TOKEN (optional; without it the release step logs a skip). No npm token
+# is used or read anywhere.
 # Repository variable MESSAGE_PUSHER_URL is REQUIRED — the webhook destination is
 # deliberately not shipped with the Action, so each repository supplies its own.
 # Optional NPM_PUBLISH_RUNNER_LABEL (default `docker`) and NPM_PUBLISH_IMAGE
-# (default `node:22-bookworm`) retarget the runner label and the job image.
-# Missing container tools (script/timeout/git) are installed with the image's
-# package manager through ALL_PROXY / APT_PROXY / APK_PROXY / YUM_PROXY;
-# SKIP_TOOL_INSTALL=true disables that.
-# Other optional variables: NOTIFY_REQUIRED, NOTIFY_TITLE_REPO_ONLY,
-# REQUIRED_ARTIFACTS, PKG_TARGET_DIR, SKIP_TEST, SKIP_BUILD, RELEASE_DIST_TAG,
-# NPM_OTP_WAIT_MINUTES.
+# (default `node:22-bookworm`, whose bundled npm is new enough) retarget the
+# runner label and the job image.
+# Missing container tools (script/git) are installed with the image's package
+# manager. APT_PROXY and NPM_PROXY are auto-classified: the value may be a real
+# forward proxy or an internal mirror/registry — ensure-tools probes whether the
+# address serves its own index and uses it as a repository/registry when it does,
+# and as a proxy when it does not. apk and yum mirrors go in APK_REPO / YUM_REPO
+# (explicit, no probe); a genuine proxy for them is the generic HTTP(S)_PROXY.
+# NPM_INSTALL_REGISTRY (install only) and NPM_CONFIG_REGISTRY (also
+# login/publish) remain as explicit overrides.
+# SKIP_TOOL_INSTALL=true disables tool installation entirely.
+# GOPROXY (or GO_PROXY) is the Go module proxy for the project's build/test.
+# Dependencies/tests/build follow the repository's lockfile (npm, pnpm or yarn),
+# and package.json's packageManager field is honoured too; login, publish,
+# version, pack and view always go through npm. Publish uploads the tarball
+# Prepare built, so the project's prepublishOnly is not run a second time.
 
 name: npm-publish
 
@@ -44,11 +62,11 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: '发布版本，例如 1.4.0；填写时必须与已有 tag 的版本一致'
+        description: '发布版本，例如 1.4.0；必须对应一个已存在的 tag（1.4.0 与 v1.4.0 都接受）'
         required: false
         type: string
       otp:
-        description: '可选：npm 一次性验证码（对应 npm publish --otp）'
+        description: '可选：npm 一次性验证码（该 registry 不支持网页二次验证时使用）'
         required: false
         type: string
       dist_tag:
@@ -56,7 +74,7 @@ on:
         required: false
         type: string
       dry_run:
-        description: '只演练 npm publish --dry-run，不写入 registry'
+        description: '只演练 npm publish --dry-run，不写入 registry，也不建 Release'
         required: false
         type: boolean
         default: false
@@ -84,31 +102,61 @@ jobs:
       image: ${{ vars.NPM_PUBLISH_IMAGE || 'node:22-bookworm' }}
     timeout-minutes: 60
     env:
+      # Non-secret configuration only. The two secrets are attached to the steps
+      # that need them, so Install dependencies / Test / Build — which execute
+      # repository and dependency code — never see them.
       MESSAGE_PUSHER_URL: ${{ vars.MESSAGE_PUSHER_URL }}
+      MESSAGE_PUSHER_REQUIRE_TOKEN: ${{ vars.MESSAGE_PUSHER_REQUIRE_TOKEN }}
       NOTIFY_REQUIRED: ${{ vars.NOTIFY_REQUIRED }}
       NOTIFY_TITLE_REPO_ONLY: ${{ vars.NOTIFY_TITLE_REPO_ONLY }}
+      NOTIFY_ATTEMPTS: ${{ vars.NOTIFY_ATTEMPTS }}
+      NOTIFY_TIMEOUT_MS: ${{ vars.NOTIFY_TIMEOUT_MS }}
       REQUIRED_ARTIFACTS: ${{ vars.REQUIRED_ARTIFACTS }}
       PKG_TARGET_DIR: ${{ vars.PKG_TARGET_DIR }}
+      PKG_MANAGER: ${{ vars.PKG_MANAGER }}
       SKIP_TEST: ${{ vars.SKIP_TEST }}
       SKIP_BUILD: ${{ vars.SKIP_BUILD }}
+      SKIP_TOOL_INSTALL: ${{ vars.SKIP_TOOL_INSTALL }}
+      # Publish uploads the tarball Prepare packed, so npm never runs the
+      # project's own prepublishOnly (prepack/prepare/postpack do run, inside
+      # `npm pack`). Set RUN_PREPUBLISH_ONLY=true to run prepublishOnly yourself
+      # before packing — it then aborts the release when it fails.
+      RUN_PREPUBLISH_ONLY: ${{ vars.RUN_PREPUBLISH_ONLY }}
       RELEASE_DIST_TAG: ${{ vars.RELEASE_DIST_TAG }}
+      # Access level for the publish. package.json's publishConfig.access wins
+      # when it is set, then this variable, then the public default.
+      PUBLISH_ACCESS: ${{ vars.PUBLISH_ACCESS }}
+      NPM_AUTH_WAIT_MINUTES: ${{ vars.NPM_AUTH_WAIT_MINUTES }}
       INPUT_VERSION: ${{ inputs.version }}
       INPUT_OTP: ${{ inputs.otp }}
       INPUT_DIST_TAG: ${{ inputs.dist_tag }}
       INPUT_DRY_RUN: ${{ inputs.dry_run }}
-      MESSAGE_PUSHER_TOKEN: ${{ secrets.MESSAGE_PUSHER_TOKEN }}
-      FORGEJO_TOKEN: ${{ secrets.FORGEJO_TOKEN }}
-      # Proxies: passed through for the package managers (ensure-tools), npm and
-      # git. Set them as repository variables when the runner has no direct egress.
+      # Endpoint variables.
+      #   APT_PROXY / NPM_PROXY — the value may be a real forward proxy OR an
+      #     internal MIRROR/registry: ensure-tools probes it (does it serve its
+      #     own index?) and uses it accordingly — apt as a repository, npm as an
+      #     install-time registry, and only a genuine proxy as a proxy.
+      #   The generic HTTP(S)_PROXY / ALL_PROXY are plain proxies for everything.
       ALL_PROXY: ${{ vars.ALL_PROXY }}
       HTTP_PROXY: ${{ vars.HTTP_PROXY }}
       HTTPS_PROXY: ${{ vars.HTTPS_PROXY }}
       NO_PROXY: ${{ vars.NO_PROXY }}
       APT_PROXY: ${{ vars.APT_PROXY }}
-      APK_PROXY: ${{ vars.APK_PROXY }}
-      YUM_PROXY: ${{ vars.YUM_PROXY }}
-      GO_PROXY: ${{ vars.GO_PROXY }}
+      NPM_PROXY: ${{ vars.NPM_PROXY }}
       NPM_CONFIG_PROXY: ${{ vars.NPM_CONFIG_PROXY }}
+      # Explicit package mirrors (comma separated; a bare mirror root is fine —
+      # the distro paths come from the image's os-release). Setting one skips the
+      # probe entirely. apk/yum mirrors go here, not into a *_PROXY variable; the
+      # longer *_REPOSITORY names are still accepted.
+      APK_REPO: ${{ vars.APK_REPO }}
+      YUM_REPO: ${{ vars.YUM_REPO }}
+      APK_REPOSITORY: ${{ vars.APK_REPOSITORY }}
+      YUM_REPOSITORY: ${{ vars.YUM_REPOSITORY }}
+      NPM_CONFIG_REGISTRY: ${{ vars.NPM_CONFIG_REGISTRY }}
+      NPM_INSTALL_REGISTRY: ${{ vars.NPM_INSTALL_REGISTRY }}
+      # Go module proxy; GO_PROXY is accepted as the same thing.
+      GOPROXY: ${{ vars.GOPROXY || vars.GO_PROXY }}
+      GO_PROXY: ${{ vars.GO_PROXY }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -121,9 +169,9 @@ jobs:
 
       # github.action_path is empty for workflows (it is set only for a
       # `uses: ./path` local action), so the copied .forgejo directory is found by
-      # the program and published as forgejo_dir. The two lines below only locate
-      # the entry point itself: the real search (nested checkouts, parent mounts,
-      # diagnostics) lives in locate-action.mjs.
+      # the program. The two lines below only locate the entry point itself: the
+      # real search (nested checkouts, parent mounts, diagnostics) lives in
+      # locate-action.mjs, which exports FORGEJO_DIR for every later step.
       - name: Locate action directory
         id: locate
         run: |
@@ -132,62 +180,54 @@ jobs:
           [ -f "$dir/scripts/run.mjs" ] || dir="$(dirname "$(dirname "$(find "$GITHUB_WORKSPACE" -maxdepth 6 -name run.mjs -path '*/scripts/*' -print -quit)")")"
           node "$dir/scripts/run.mjs" locate-action
 
-      # Install missing container tools (script/timeout/git) with the image's own
-      # package manager, through the configured proxy. Skipped automatically when
-      # everything is present; SKIP_TOOL_INSTALL=true opts out.
+      # Install missing container tools (script/git) with the image's own package
+      # manager, through the configured proxy, and check that npm is new enough.
+      # Skipped automatically when everything is present; SKIP_TOOL_INSTALL=true
+      # opts out.
       - name: Ensure container tools
-        run: |
-          dir="${{ steps.locate.outputs.forgejo_dir }}"
-          node "$dir/scripts/run.mjs" ensure-tools
+        run: node "$FORGEJO_DIR/scripts/run.mjs" ensure-tools
 
       - name: Verify action scripts
-        run: |
-          dir="${{ steps.locate.outputs.forgejo_dir }}"
-          node "$dir/scripts/run.mjs" verify-action
+        run: node "$FORGEJO_DIR/scripts/run.mjs" verify-action
 
       - name: Install dependencies
-        run: |
-          dir="${{ steps.locate.outputs.forgejo_dir }}"
-          node "$dir/scripts/run.mjs" install-deps
+        run: node "$FORGEJO_DIR/scripts/run.mjs" install-deps
 
       - name: Resolve version from tag
-        run: |
-          dir="${{ steps.locate.outputs.forgejo_dir }}"
-          node "$dir/scripts/run.mjs" resolve
+        run: node "$FORGEJO_DIR/scripts/run.mjs" resolve
 
+      # Idempotence lives here: when the version is already on the registry the
+      # step emits already_published=true and the release steps below are
+      # skipped, so re-pushing a tag is a green no-op instead of a registry
+      # rejection.
       - name: Preflight version checks
-        run: |
-          dir="${{ steps.locate.outputs.forgejo_dir }}"
-          node "$dir/scripts/run.mjs" preflight
+        id: preflight
+        run: node "$FORGEJO_DIR/scripts/run.mjs" preflight
 
       - name: Test
-        run: |
-          dir="${{ steps.locate.outputs.forgejo_dir }}"
-          node "$dir/scripts/run.mjs" test
+        if: steps.preflight.outputs.already_published != 'true'
+        run: node "$FORGEJO_DIR/scripts/run.mjs" test
 
       - name: Build
-        run: |
-          dir="${{ steps.locate.outputs.forgejo_dir }}"
-          node "$dir/scripts/run.mjs" build
+        if: steps.preflight.outputs.already_published != 'true'
+        run: node "$FORGEJO_DIR/scripts/run.mjs" build
 
+      # Verifies REQUIRED_ARTIFACTS after Build and before packing, aligns the
+      # version, packs and hashes.
       - name: Prepare package
-        run: |
-          dir="${{ steps.locate.outputs.forgejo_dir }}"
-          node "$dir/scripts/run.mjs" prepare
+        if: steps.preflight.outputs.already_published != 'true'
+        run: node "$FORGEJO_DIR/scripts/run.mjs" prepare
 
       - name: Publish to npm
-        run: |
-          dir="${{ steps.locate.outputs.forgejo_dir }}"
-          node "$dir/scripts/run.mjs" publish
+        if: steps.preflight.outputs.already_published != 'true'
+        env:
+          MESSAGE_PUSHER_TOKEN: ${{ secrets.MESSAGE_PUSHER_TOKEN }}
+        run: node "$FORGEJO_DIR/scripts/run.mjs" publish
 
+      # Runs after a publish (or after an already-published no-op, so a release
+      # that failed last time can still be created). The token is scoped to this
+      # step; without it the program logs a skip.
       - name: Create Forgejo release
-        if: env.FORGEJO_TOKEN != ''
-        run: |
-          dir="${{ steps.locate.outputs.forgejo_dir }}"
-          node "$dir/scripts/run.mjs" release
-
-      - name: Notify failure
-        if: failure()
-        run: |
-          dir="${{ steps.locate.outputs.forgejo_dir }}"
-          node "$dir/scripts/run.mjs" notify-failure
+        env:
+          FORGEJO_TOKEN: ${{ secrets.FORGEJO_TOKEN }}
+        run: node "$FORGEJO_DIR/scripts/run.mjs" release

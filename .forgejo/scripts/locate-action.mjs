@@ -12,22 +12,12 @@
 // can call `node "$dir/scripts/…"`, and prints a full diagnostic when nothing
 // matches.
 
-import { appendFileSync, existsSync, readdirSync, realpathSync } from 'node:fs';
+import { appendFileSync, existsSync, readdirSync } from 'node:fs';
 import { dirname, join, resolve, sep } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { isDirect } from './is-direct.mjs';
 
 /** The workflow invokes this with `node "$dir/scripts/run.mjs" locate-action`. */
-// Run directly (argv[1] is this file) rather than imported by a test.
-// Compare real paths: /tmp is a symlink on some hosts, and path.resolve
-// would then disagree with import.meta.url.
-export const IS_DIRECT = (() => {
-  if (!process.argv[1] || !process.argv[1].endsWith('.mjs')) return false;
-  try {
-    return realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
-  } catch {
-    return false;
-  }
-})();
+export const IS_DIRECT = isDirect(import.meta.url);
 
 /** A directory is the Action when the workflow and the programs are both there. */
 export function isActionDir(dir) {
@@ -130,10 +120,18 @@ async function main() {
     process.exit(1);
   }
 
+  // The path is written into $GITHUB_OUTPUT and $GITHUB_ENV, both of which are
+  // newline-delimited files: a path carrying a newline would inject extra keys,
+  // so it is stripped before it is published.
+  const safeDir = dir.replace(/[\r\n]/g, '');
   if (process.env.GITHUB_OUTPUT) {
-    appendFileSync(process.env.GITHUB_OUTPUT, `forgejo_dir=${dir}\n`);
+    appendFileSync(process.env.GITHUB_OUTPUT, `forgejo_dir=${safeDir}\n`);
   }
-  process.stdout.write(`Action 目录：${dir}\n`);
+  if (process.env.GITHUB_ENV) {
+    // One line per later step: `node "$FORGEJO_DIR/scripts/run.mjs" <sub>`.
+    appendFileSync(process.env.GITHUB_ENV, `FORGEJO_DIR=${safeDir}\n`);
+  }
+  process.stdout.write(`Action 目录：${safeDir}\n`);
 }
 
 if (IS_DIRECT) {

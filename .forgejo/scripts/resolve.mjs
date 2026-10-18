@@ -1,20 +1,10 @@
-import { appendFileSync, writeFileSync, realpathSync } from 'node:fs';
+import { appendFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { readOptional } from './notify-lib.mjs';
+import { isDirect } from './is-direct.mjs';
 
 export const SEMVER = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z.-]+)?$/;
-// Run directly (argv[1] is this file) rather than imported by a test.
-// Compare real paths: /tmp is a symlink on some hosts, and path.resolve
-// would then disagree with import.meta.url.
-export const IS_DIRECT = (() => {
-  if (!process.argv[1] || !process.argv[1].endsWith('.mjs')) return false;
-  try {
-    return realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
-  } catch {
-    return false;
-  }
-})();
+export const IS_DIRECT = isDirect(import.meta.url);
 
 export function stripTagPrefix(tag) {
   let value = String(tag || '').trim();
@@ -36,12 +26,24 @@ export function tagVersionFromRef(ref) {
 export function resolveRelease(env = process.env) {
   const inputVersion = readOptional(env.INPUT_VERSION);
   const refName = readOptional(env.GITHUB_REF_NAME);
-  const rawTag = inputVersion || refName || tagVersionFromRef(readOptional(env.GITHUB_REF));
+  const ref = readOptional(env.GITHUB_REF);
+  const dispatch = readOptional(env.GITHUB_EVENT_NAME) === 'workflow_dispatch';
+  const refIsTag = ref.startsWith('refs/tags/') || (!ref && !dispatch && Boolean(refName));
+  const refTag = refIsTag ? refName || tagVersionFromRef(ref) : '';
+
+  // A manual dispatch usually runs on a branch, where GITHUB_REF_NAME is the
+  // branch and says nothing about the tag. The typed version is the tag to look
+  // for; preflight accepts both "1.4.0" and "v1.4.0" spellings.
+  const rawTag = refTag || inputVersion;
   const version = stripTagPrefix(rawTag);
   if (!SEMVER.test(version)) throw new Error(`无法从 tag 解析出合法版本号：${rawTag || '<empty>'}`);
-  if (inputVersion && stripTagPrefix(inputVersion) !== stripTagPrefix(refName)) {
+
+  // Only a run that actually sits on the tag can be cross-checked against the
+  // ref; a dispatch on a branch is validated by preflight against the tag's
+  // commit instead of against the branch name.
+  if (inputVersion && refTag && stripTagPrefix(inputVersion) !== stripTagPrefix(refTag)) {
     throw new Error(
-      `手工输入的版本（${inputVersion}）与触发 ref（${refName || '<none>'}）不一致，已中止以避免误发`,
+      `手工输入的版本（${inputVersion}）与触发 ref（${refTag || '<none>'}）不一致，已中止以避免误发`,
     );
   }
 
@@ -53,6 +55,8 @@ export function resolveRelease(env = process.env) {
   return {
     version,
     tag: rawTag,
+    tagIsExact: Boolean(refTag),
+    dispatch,
     prerelease,
     distTag: distTag || (prerelease ? 'next' : 'latest'),
     dryRun: readOptional(env.INPUT_DRY_RUN).toLowerCase() === 'true',
